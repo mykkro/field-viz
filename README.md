@@ -145,7 +145,7 @@ are computed in physical units.
 | `.vti` VTK XML ImageData | ✓     | ✓     | `ascii` or inline `binary` (uncompressed). Appended or compressed data is not supported.                                                                             |
 | `.npy` NumPy             | ✓     | ✓     | `float32`, shape `(nz, ny, nx, 3)`, so `a[k, j, i]` is the vector at (x_i, y_j, z_k). Shape `(3, nz, ny, nx)`, other dtypes and Fortran order are also accepted. |
 | `.csv`                   | ✓     | ✓     | Columns `x,y,z,vx,vy,vz`. Also accepts `u,v,w` or ParaView names (`Points:0`, `velocity:0`, ...). Rows may be in any order but must form a complete grid.        |
-| `.json`                  | ✓     | ✓     | `{"dims":[nx,ny,nz], "data":[vx,vy,vz,...]}`                                                                                                                           |
+| `.json`                  | ✓     | ✓     | `{"dims":[nx,ny,nz], "origin":[x0,y0,z0], "spacing":[dx,dy,dz], "data":[vx,vy,vz,...]}`; origin and spacing are optional                                              |
 
 Loading data from NumPy:
 
