@@ -1,12 +1,15 @@
 # field-viz
 
-A WebGL viewer for 3D vector fields on regular grids (air flow, velocity fields, force fields).
+A WebGL viewer for 3D vector fields (air flow, velocity fields, force fields) on regular,
+rectilinear and terrain-following grids.
 It is a single HTML page using three.js. Two backends are optional: a stdlib-only Python REST
 server, and a Flask + ZeroMQ relay that streams time-varying data live.
 
 ![Tornado field with animated streamlines](docs/screenshot.png)
 
 ![Flow past a sphere rendered as stream tubes](docs/screenshot-tubes.png)
+
+![WindNinja-like terrain wind example](docs/screenshot-terrain.png)
 
 ## Features
 
@@ -18,8 +21,11 @@ server, and a Flask + ZeroMQ relay that streams time-varying data live.
     animated pulses that move at the flow speed, or as shaded tubes.
   - **Particles:** advected particles with fading trails.
   - **Slice plane:** colored by speed, vorticity |∇×v|, divergence ∇·v, or vx/vy/vz.
-- **Seeding** (for streamlines and particles): per-field default, random, inlet face, slice plane,
-  sphere, diagonal rake, ground ring.
+- **Seeding** (for streamlines and particles): per-field default, random, upwind face, inlet face,
+  slice plane, sphere, diagonal rake, ground ring. Seeds never start inside terrain.
+- **Terrain wind:** imports curvilinear `STRUCTURED_GRID` files such as WindNinja's 3D output.
+  The terrain is drawn as a surface; streamlines and particles stop at the ground.
+- **Any domain shape:** true proportions or stretched to a cube, with z exaggeration.
 - **Presets:** arrows overview, animated streamlines, stream tubes, particle smoke, slice + vectors,
   vorticity + streamlines, everything.
 - **Palettes:** turbo, viridis, plasma, inferno, magma, cividis, jet, ice, greys, coolwarm, RdBu, PiYG.
@@ -47,6 +53,11 @@ three.js and lil-gui load from the jsDelivr CDN, so the page needs internet acce
 
 Open `index.html` directly, or serve the folder with any static server
 (`python -m http.server`, nginx, GitHub Pages, ...). All fields are generated in the browser.
+
+**Example dataset:** [examples/windninja_like.vtk](examples/windninja_like.vtk) is synthetic terrain
+wind in the style of WindNinja's output (details below). Click **Data → Load example: terrain
+wind**, which needs the page to be served over HTTP (option 1 with `python -m http.server`, or
+2–3), or drag the file onto the page.
 
 ### 2. REST server
 
@@ -141,11 +152,43 @@ are computed in physical units.
 
 | Format                     | Import | Export | Notes                                                                                                                                                                    |
 | -------------------------- | ------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `.vtk` VTK legacy        | ✓     | ✓     | `STRUCTURED_POINTS`, ASCII or BINARY; uses the first point `VECTORS` (or a 3-component `FIELD` array). Opens in ParaView/VisIt.                                    |
+| `.vtk` VTK legacy        | ✓     | ✓     | `STRUCTURED_POINTS` (exported), plus import of `RECTILINEAR_GRID` and `STRUCTURED_GRID` (see below). ASCII or BINARY; uses the first point `VECTORS` (or a 3-component `FIELD` array). Opens in ParaView/VisIt. |
 | `.vti` VTK XML ImageData | ✓     | ✓     | `ascii` or inline `binary` (uncompressed). Appended or compressed data is not supported.                                                                             |
 | `.npy` NumPy             | ✓     | ✓     | `float32`, shape `(nz, ny, nx, 3)`, so `a[k, j, i]` is the vector at (x_i, y_j, z_k). Shape `(3, nz, ny, nx)`, other dtypes and Fortran order are also accepted. |
 | `.csv`                   | ✓     | ✓     | Columns `x,y,z,vx,vy,vz`. Also accepts `u,v,w` or ParaView names (`Points:0`, `velocity:0`, ...). Rows may be in any order but must form a complete grid.        |
 | `.json`                  | ✓     | ✓     | `{"dims":[nx,ny,nz], "origin":[x0,y0,z0], "spacing":[dx,dy,dz], "data":[vx,vy,vz,...]}`; origin and spacing are optional                                              |
+
+### Non-uniform grids (structured grids, rectilinear grids, terrain-following meshes)
+
+The viewer samples regular grids, so a VTK `STRUCTURED_GRID` (point coordinates for every node)
+or `RECTILINEAR_GRID` (non-uniform x/y/z coordinate lists) is **resampled onto a regular grid
+when it is imported**. The info panel shows the source and target sizes.
+
+- **Terrain-following grids**, as produced by WindNinja and many atmospheric models: x depends
+  only on i, y only on j, and z increases up each column. These are interpolated exactly, column
+  by column. Points below the terrain or above the model top are masked: they have zero
+  velocity, show grey on slices, and stop streamlines and particles. The bottom layer is drawn as
+  a terrain surface, and the default seeding is the upwind face, with seeds denser near the
+  ground. The horizontal resolution is kept; the vertical one is doubled (up to 160 levels) so
+  that the thin near-ground layers are resolved.
+- **Rectilinear grids** take the same exact path.
+- **Any other curvilinear grid** (rotated, skewed, ...) uses inverse-distance weighting of the
+  nearby source points. This is approximate; points with no source point nearby are masked.
+
+**Example:** `examples/windninja_like.vtk` (61×46×18 points, 3.6 × 2.7 km, terrain 337–692 m)
+is made by [examples/make_windninja_like.py](examples/make_windninja_like.py) (needs numpy).
+It is a plausible but *not* physically solved field: a log wind profile, speed-up over ridges,
+flow deflected along slopes, and vertical motion that follows the terrain. It uses a binary
+`STRUCTURED_GRID` with geometrically stretched layers, plus a `speed` scalar. Generate variants
+with:
+
+```
+python examples/make_windninja_like.py --direction 300 --speed 10 --nx 101 --ny 81 --nz 24 -o my.vtk
+python examples/make_windninja_like.py --ascii -o ascii.vtk
+```
+
+With real WindNinja runs, enable its VTK output and load the `.vtk` file. Its exact layout has
+not been verified against this importer yet.
 
 Loading data from NumPy:
 

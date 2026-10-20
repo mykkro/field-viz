@@ -8,6 +8,7 @@ venv/
 # Exported / downloaded field data
 *.vtk
 *.vti
+!examples/*.vtk
 *.npy
 *.npz
 data/

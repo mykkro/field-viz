@@ -127,6 +127,8 @@ class Field {
     this.k = k;                         // world units per physical unit, per axis
     this.kn = k.map(x => x / km);       // direction mapping (1,1,1 when proportions are kept)
   }
+  setMask(m) { this.mask = m; this.maskF = Float32Array.from(m); }   // 1 = solid (below terrain) / no data
+  solidAt(x, y, z) { return !!this.maskF && this.sampleScalar(this.maskF, x, y, z) > 0.5; }
   coord(i, a) { return this.lo[a] + (this.hi[a] - this.lo[a]) * i / (this.dims[a] - 1); }   // world
   phys(i, a) { return this.origin[a] + this.spacing[a] * i; }                               // physical
   physToWorld(p) { return p.map((c, a) => this.lo[a] + (c - this.origin[a]) * this.k[a]); }
@@ -194,7 +196,10 @@ class Field {
       this.vort[p] = Math.hypot(wx, wy, wz);
       this.div[p] = d(0, i, j, k, 0) + d(1, i, j, k, 1) + d(2, i, j, k, 2);
     }
-    const pct = (arr, q) => { const s = Float32Array.from(arr).sort(); return s[Math.min(s.length - 1, Math.floor(q * s.length))]; };
+    const fluid = this.mask ? (_, i) => !this.mask[i] : () => true;   // ranges ignore solid points
+    const pct = (arr, q) => { const s = arr.filter(fluid).sort(); return s[Math.min(s.length - 1, Math.floor(q * s.length))] || 0; };
+    this.meanV = [0, 0, 0];
+    for (let p = 0; p < N; p++) if (fluid(0, p)) for (let c = 0; c < 3; c++) this.meanV[c] += v[p * 3 + c];
     this.maxSpeed = pct(this.speed, 1);
     this.ref = pct(this.speed, 0.98) || 1;   // robust colour range (ignores singular spikes)
     this.vortRef = pct(this.vort, 0.98) || 1;
@@ -486,17 +491,26 @@ function applyLiveFrame(buf) {
 // ---------------------------------------------------------------------------
 // Seeding: one random point per call, by mode
 // ---------------------------------------------------------------------------
-const SEED_MODES = ['auto', 'random', 'inlet (−X face)', 'slice plane', 'sphere r=0.5', 'diagonal rake', 'ground ring'];
+const SEED_MODES = ['auto', 'random', 'upwind face', 'inlet (−X face)', 'slice plane', 'sphere r=0.5', 'diagonal rake', 'ground ring'];
 function spawnPoint(mode, rng) {
   if (mode === 'auto') {
     if (gen.spawn) return field.physToWorld(gen.spawn(rng));   // generator spawners work in physical coords
-    mode = ({ inlet: 'inlet (−X face)', ring: 'ground ring' })[gen.seeding] || 'random';
+    mode = ({ inlet: 'inlet (−X face)', ring: 'ground ring', upwind: 'upwind face' })[gen.seeding] || 'random';
   }
-  return field.normToWorld(spawnNorm(mode, rng));
+  let p;
+  for (let t = 0; t < 30; t++) {   // avoid seeds inside the terrain / no-data regions
+    p = field.normToWorld(spawnNorm(mode, rng));
+    if (!field.solidAt(...p)) break;
+  }
+  return p;
 }
 function spawnNorm(mode, rng) {   // in the normalised box [-1,1]^3
   const u = () => rng() * 1.9 - 0.95;
   switch (mode) {
+    case 'upwind face': {   // the side face(s) the mean horizontal wind blows in from
+      const [mx, my] = field.meanV, ax = Math.abs(mx) + Math.abs(my) || 1;
+      const a = rng() * ax < Math.abs(mx) ? 0 : 1, p = [u(), u(), -0.95 + 1.9 * rng() ** 2];   // denser near the ground
+      p[a] = -0.98 * Math.sign(field.meanV[a] || 1); return p; }
     case 'inlet (−X face)': return [-0.98, u(), u()];
     case 'slice plane': {
       const p = [u(), u(), u()], ax = { x: 0, y: 1, z: 2 }[params.slice.axis];
@@ -608,7 +622,7 @@ function integrate(p0, dir, h, maxSteps, eps) {
     x += H / 6 * (k1[0] + 2*k2[0] + 2*k3[0] + k4[0]);
     y += H / 6 * (k1[1] + 2*k2[1] + 2*k3[1] + k4[1]);
     z += H / 6 * (k1[2] + 2*k2[2] + 2*k3[2] + k4[2]);
-    if (!field.sample(x, y, z, v)) break;
+    if (!field.sample(x, y, z, v) || (field.maskF && field.solidAt(x, y, z))) break;   // left the box / hit terrain
     out.push([x, y, z, Math.hypot(...v)]);
   }
   return out;
@@ -757,7 +771,7 @@ function updateParticles(dt) {
     if (ok) { // midpoint (RK2) step
       const mx = x + 0.5 * k * kn[0] * _v[0], my = y + 0.5 * k * kn[1] * _v[1], mz = z + 0.5 * k * kn[2] * _v[2];
       ok = field.sample(mx, my, mz, _v);
-      if (ok) { x += k * kn[0] * _v[0]; y += k * kn[1] * _v[1]; z += k * kn[2] * _v[2]; ok = field.sample(x, y, z, _v); }
+      if (ok) { x += k * kn[0] * _v[0]; y += k * kn[1] * _v[1]; z += k * kn[2] * _v[2]; ok = field.sample(x, y, z, _v) && !field.solidAt(x, y, z); }
     }
     if (!ok) { respawn(i); x = hist[b]; y = hist[b+1]; z = hist[b+2]; field.sample(x, y, z, _v); }
     hist.copyWithin(b + 3, b, b + (T - 1) * 3);
@@ -801,7 +815,8 @@ function rebuildSlice() {
     else if (S.quantity === 'divergence') val = field.sampleScalar(field.div, x, y, z);
     else if (S.quantity.startsWith('vort')) val = field.sampleScalar(field.vort, x, y, z);
     else { field.sample(x, y, z, v); val = v[comp]; }
-    cmap(info.cm, (val - info.lo) / (info.hi - info.lo), rgb);
+    if (field.solidAt(x, y, z)) rgb[0] = rgb[1] = rgb[2] = 0.22;   // terrain / no data: neutral grey
+    else cmap(info.cm, (val - info.lo) / (info.hi - info.lo), rgb);
     const o = (j * R + i) * 4;
     data[o] = rgb[0] * 255; data[o+1] = rgb[1] * 255; data[o+2] = rgb[2] * 255; data[o+3] = 255;
   }
@@ -1023,11 +1038,17 @@ const FORMATS = {
       if (!r.line().startsWith('# vtk')) throw new Error('missing "# vtk DataFile" header');
       r.line();   // title
       const bin = (r.next() || '').toUpperCase() === 'BINARY';
-      let dims, n = 0, cell = false, vec = null, origin, spacing;
+      let dims, n = 0, cell = false, vec = null, origin, spacing, dataset, points, coords = [];
       for (let l; !vec && (l = r.next()) !== null;) {
         const t = l.split(/\s+/), kw = t[0].toUpperCase();
-        if (kw === 'DATASET') { if (t[1].toUpperCase() !== 'STRUCTURED_POINTS') throw new Error(`only STRUCTURED_POINTS is supported (file has ${t[1]})`); }
+        if (kw === 'DATASET') {
+          dataset = t[1].toUpperCase();
+          if (!['STRUCTURED_POINTS', 'STRUCTURED_GRID', 'RECTILINEAR_GRID'].includes(dataset))
+            throw new Error(`unsupported dataset ${t[1]} (use STRUCTURED_POINTS, STRUCTURED_GRID or RECTILINEAR_GRID)`);
+        }
         else if (kw === 'DIMENSIONS') dims = t.slice(1, 4).map(Number);
+        else if (kw === 'POINTS') points = r.values(+t[1] * 3, typeCode(VTK_T, t[2]), bin);
+        else if (/^[XYZ]_COORDINATES$/.test(kw)) coords['XYZ'.indexOf(kw[0])] = r.values(+t[1], typeCode(VTK_T, t[2]), bin);
         else if (kw === 'ORIGIN') origin = t.slice(1, 4).map(Number);
         else if (kw === 'SPACING' || kw === 'ASPECT_RATIO') spacing = t.slice(1, 4).map(Number);
         else if (kw === 'POINT_DATA' || kw === 'CELL_DATA') { n = +t[1]; cell = kw === 'CELL_DATA'; }
@@ -1048,6 +1069,16 @@ const FORMATS = {
       }
       if (!dims) throw new Error('no DIMENSIONS found');
       if (!vec) throw new Error('no point VECTORS (or 3-component FIELD array) found');
+      if (dataset === 'RECTILINEAR_GRID') {   // expand per-axis coordinates into points
+        if (coords.length < 3 || coords.some(c => !c)) throw new Error('RECTILINEAR_GRID without X/Y/Z_COORDINATES');
+        const [nx, ny, nz] = dims; points = new Float64Array(nx * ny * nz * 3); let p = 0;
+        for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+          points[p++] = coords[0][i]; points[p++] = coords[1][j]; points[p++] = coords[2][k]; }
+      }
+      if (dataset !== 'STRUCTURED_POINTS' && dataset) {
+        if (!points || points.length !== dims[0] * dims[1] * dims[2] * 3) throw new Error('POINTS missing or not matching DIMENSIONS');
+        return { dims, data: Float32Array.from(vec), points, grid: dataset };
+      }
       return { dims, data: Float32Array.from(vec), origin, spacing };
     },
     write(f) {
@@ -1173,6 +1204,123 @@ const FORMATS = {
 };
 const EXT_FORMAT = { vtk: 'VTK legacy (.vtk)', vti: 'VTK XML ImageData (.vti)', npy: 'NumPy (.npy)', csv: 'CSV (.csv)', txt: 'CSV (.csv)', json: 'JSON (.json)' };
 
+// ---------------------------------------------------------------------------
+// Curvilinear / rectilinear grids -> regular grid (the viewer samples regular grids only).
+//  * terrain-following (x depends only on i, y only on j, z increasing along each column), e.g.
+//    WindNinja: exact per-column interpolation; points below the terrain are masked as solid
+//  * anything else: inverse-distance weighting of nearby source points (hash-grid lookup)
+// ---------------------------------------------------------------------------
+function resampleStructured(dims, P, V) {
+  const [nx, ny, nz] = dims, N = nx * ny * nz, id = (i, j, k) => (k * ny + j) * nx + i;
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let p = 0; p < N; p++) for (let a = 0; a < 3; a++) { const c = P[p * 3 + a]; if (c < lo[a]) lo[a] = c; if (c > hi[a]) hi[a] = c; }
+  const ext = hi.map((h, a) => h - lo[a]);
+  if (ext.some(e => !(e > 0))) throw new Error('grid is flat along one axis');
+  const tol = 1e-4 * Math.max(...ext);
+
+  // terrain-following test
+  const xs = Float64Array.from({ length: nx }, (_, i) => P[id(i, 0, 0) * 3]);
+  const ys = Float64Array.from({ length: ny }, (_, j) => P[id(0, j, 0) * 3 + 1]);
+  const incr = a => a.every((v, i) => i === 0 || v > a[i - 1]);
+  let columns = incr(xs) && incr(ys) && nx > 1 && ny > 1 && nz > 1;
+  for (let k = 0; columns && k < nz; k++) for (let j = 0; columns && j < ny; j++) for (let i = 0; i < nx; i++) {
+    const p = id(i, j, k) * 3;
+    if (Math.abs(P[p] - xs[i]) > tol || Math.abs(P[p + 1] - ys[j]) > tol || (k > 0 && !(P[p + 2] > P[id(i, j, k - 1) * 3 + 2]))) { columns = false; break; }
+  }
+
+  let tdims;
+  if (columns) {
+    // horizontal: keep the source resolution; vertical: resolve the (thin) layers, capped
+    const tz = Math.min(160, Math.max(24, 2 * nz), Math.floor(4e6 / (nx * ny)));
+    tdims = [nx, ny, Math.max(2, tz)];
+  } else {
+    const s = Math.cbrt(ext[0] * ext[1] * ext[2] / Math.min(N, 1.5e6));
+    tdims = ext.map(e => Math.max(2, Math.min(200, Math.round(e / s) + 1)));
+  }
+  const [tx, ty, tz] = tdims, T = tx * ty * tz;
+  const spacing = ext.map((e, a) => e / (tdims[a] - 1));
+  const out = new Float32Array(T * 3), mask = new Uint8Array(T);
+  const locate = (arr, v) => {   // arr ascending -> [index, fraction], clamped
+    let a = 0, b = arr.length - 1;
+    if (v <= arr[0]) return [0, 0]; if (v >= arr[b]) return [b - 1, 1];
+    while (b - a > 1) { const m = (a + b) >> 1; if (arr[m] <= v) a = m; else b = m; }
+    return [a, (v - arr[a]) / (arr[a + 1] - arr[a])];
+  };
+
+  let terrain = null;
+  if (columns) {
+    const colZ = (i, j, k) => P[id(i, j, k) * 3 + 2];
+    const col = new Float64Array(nz), acc = [0, 0, 0];
+    const addColumn = (i, j, w, z) => {   // linear interpolation along one source column
+      for (let k = 0; k < nz; k++) col[k] = colZ(i, j, k);
+      const [k0, f] = locate(col, z), a = id(i, j, k0) * 3, b = id(i, j, k0 + 1) * 3;
+      for (let c = 0; c < 3; c++) acc[c] += w * (V[a + c] + (V[b + c] - V[a + c]) * f);
+    };
+    for (let J = 0; J < ty; J++) for (let I = 0; I < tx; I++) {
+      const [i0, fx] = locate(xs, lo[0] + I * spacing[0]), [j0, fy] = locate(ys, lo[1] + J * spacing[1]);
+      const w = [(1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy];
+      const cs = [[i0, j0], [i0 + 1, j0], [i0, j0 + 1], [i0 + 1, j0 + 1]];
+      let ground = 0, top = 0;
+      cs.forEach(([i, j], q) => { ground += w[q] * colZ(i, j, 0); top += w[q] * colZ(i, j, nz - 1); });
+      for (let K = 0; K < tz; K++) {
+        const z = lo[2] + K * spacing[2], t = (K * ty + J) * tx + I;
+        if (z < ground - tol || z > top + tol) { mask[t] = 1; continue; }   // below terrain / above model top
+        acc[0] = acc[1] = acc[2] = 0;
+        cs.forEach(([i, j], q) => w[q] && addColumn(i, j, w[q], z));
+        out[t * 3] = acc[0]; out[t * 3 + 1] = acc[1]; out[t * 3 + 2] = acc[2];
+      }
+    }
+    const tzs = new Float32Array(nx * ny);
+    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) tzs[j * nx + i] = colZ(i, j, 0);
+    terrain = { nx, ny, xs, ys, z: tzs };
+  } else {
+    // inverse-distance weighting within radius r using a hash grid of source points
+    const r = 1.5 * Math.max(...spacing), inv = 1 / r, key = (a, b, c) => (a * 73856093) ^ (b * 19349663) ^ (c * 83492791);
+    const buckets = new Map();
+    for (let p = 0; p < N; p++) {
+      const k = key(Math.floor((P[p * 3] - lo[0]) * inv), Math.floor((P[p * 3 + 1] - lo[1]) * inv), Math.floor((P[p * 3 + 2] - lo[2]) * inv));
+      let b = buckets.get(k); if (!b) buckets.set(k, b = []); b.push(p);
+    }
+    for (let K = 0; K < tz; K++) for (let J = 0; J < ty; J++) for (let I = 0; I < tx; I++) {
+      const x = lo[0] + I * spacing[0], y = lo[1] + J * spacing[1], z = lo[2] + K * spacing[2], t = (K * ty + J) * tx + I;
+      const bx = Math.floor((x - lo[0]) * inv), by = Math.floor((y - lo[1]) * inv), bz = Math.floor((z - lo[2]) * inv);
+      let ws = 0, vx = 0, vy = 0, vz = 0;
+      for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let c = -1; c <= 1; c++) {
+        const list = buckets.get(key(bx + a, by + b, bz + c)); if (!list) continue;
+        for (const p of list) {
+          const d2 = (P[p * 3] - x) ** 2 + (P[p * 3 + 1] - y) ** 2 + (P[p * 3 + 2] - z) ** 2;
+          if (d2 > r * r) continue;
+          const w = 1 / (d2 + 1e-12 * r * r); ws += w; vx += w * V[p * 3]; vy += w * V[p * 3 + 1]; vz += w * V[p * 3 + 2];
+        }
+      }
+      if (!ws) { mask[t] = 1; continue; }
+      out[t * 3] = vx / ws; out[t * 3 + 1] = vy / ws; out[t * 3 + 2] = vz / ws;
+    }
+  }
+  return { dims: tdims, data: out, origin: lo, spacing, mask, terrain, method: columns ? 'exact column interpolation' : 'inverse-distance' };
+}
+
+// Terrain surface from the bottom layer of a terrain-following grid (physical coordinates)
+const TERRAIN_STOPS = ['#2f4f2f', '#4f7a3a', '#8a9a55', '#b8a46a', '#9c7b55', '#d9d4cc'].map(hexRGB);
+function addTerrain(g, t) {
+  const { nx, ny, xs, ys, z } = t, pos = new Float32Array(nx * ny * 3), col = new Float32Array(nx * ny * 3), idx = [];
+  let zmin = Infinity, zmax = -Infinity; for (const h of z) { zmin = Math.min(zmin, h); zmax = Math.max(zmax, h); }
+  const c = new THREE.Color();
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    const p = j * nx + i, s = (z[p] - zmin) / (zmax - zmin || 1) * (TERRAIN_STOPS.length - 1);
+    const a = Math.min(Math.floor(s), TERRAIN_STOPS.length - 2), f = s - a, A = TERRAIN_STOPS[a], B = TERRAIN_STOPS[a + 1];
+    pos.set([xs[i], ys[j], z[p]], p * 3);
+    c.setRGB(A[0] + (B[0] - A[0]) * f, A[1] + (B[1] - A[1]) * f, A[2] + (B[2] - A[2]) * f, THREE.SRGBColorSpace);
+    col.set([c.r, c.g, c.b], p * 3);
+    if (i < nx - 1 && j < ny - 1) idx.push(p, p + 1, p + nx, p + 1, p + nx + 1, p + nx);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  geo.setIndex(idx); geo.computeVertexNormals();
+  g.add(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9, side: THREE.DoubleSide })));
+}
+
 function exportField() {
   const fmt = FORMATS[params.exportFormat];
   const blob = new Blob(fmt.write(field), { type: fmt.mime });
@@ -1180,26 +1328,46 @@ function exportField() {
   a.download = `${genName.replace(/\W+/g, '_')}_${field.nx}x${field.ny}x${field.nz}.${fmt.ext}`;
   a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
-async function importFile(file) {
+async function importFile(file) { return importBuffer(file.name, () => file.arrayBuffer()); }
+async function importBuffer(fileName, getBuffer) {
   busy.style.display = 'block';
+  await new Promise(r => setTimeout(r, 20));   // let the "Computing…" badge paint
   try {
-    const name = EXT_FORMAT[file.name.split('.').pop().toLowerCase()];
+    const name = EXT_FORMAT[fileName.split('.').pop().toLowerCase()];
     if (!name) throw new Error('unknown extension (use .vtk, .vti, .npy, .csv or .json)');
-    const { dims: [nx, ny, nz], data, origin, spacing } = FORMATS[name].read(await file.arrayBuffer());
+    let res = FORMATS[name].read(await getBuffer()), note = '';
+    if (res.points) {
+      const src = res.dims.join('×'), grid = res.grid;
+      res = resampleStructured(res.dims, res.points, res.data);
+      const kind = grid === 'RECTILINEAR_GRID' ? 'Rectilinear' : res.terrain && res.mask.some(m => m) ? 'Terrain-following' : 'Structured';
+      note = ` ${kind} grid ${src}, resampled to a regular ${res.dims.join('×')} grid (${res.method}${res.method === 'inverse-distance' ? ', approximate' : ''}).`;
+    }
+    const { dims: [nx, ny, nz], data, origin, spacing } = res;
     if (!(nx >= 2 && ny >= 2 && nz >= 2)) throw new Error(`grid must be at least 2 points per axis (got ${nx}×${ny}×${nz})`);
     if (data.length !== nx * ny * nz * 3) throw new Error(`expected ${nx * ny * nz * 3} values, got ${data.length}`);
     // formats without geometry (.npy) get unit spacing, so the box follows the grid dimensions
     const sp = spacing?.length === 3 && spacing.every(s => s > 0) ? spacing : [1, 1, 1];
-    field = new Field(nx, ny, nz, data, origin?.length === 3 ? origin : [0, 0, 0], sp); field.computeDerived();
-    gen = { desc: `Loaded from ${file.name} (${name}).`, seeding: 'random' }; genName = 'Custom field';
+    disconnectLive();
+    field = new Field(nx, ny, nz, data, origin?.length === 3 ? origin : [0, 0, 0], sp);
+    if (res.mask?.some(m => m)) field.setMask(res.mask);
+    field.computeDerived();
+    const terrain = res.terrain;
+    gen = { desc: `Loaded from ${fileName} (${name}).${note}`, seeding: terrain ? 'upwind' : 'random',
+            decorate: terrain ? g => addTerrain(g, terrain) : undefined };
+    genName = 'Custom field';
     rebuildAll();
-  } catch (err) { alert(`Could not load ${file.name}: ${err.message}`); }
+  } catch (err) { console.error(err); alert(`Could not load ${fileName}: ${err.message}`); }
   busy.style.display = 'none';
 }
 document.getElementById('fileInput').addEventListener('change', e => { if (e.target.files[0]) importFile(e.target.files[0]); e.target.value = ''; });
 addEventListener('dragover', e => e.preventDefault());
 addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer.files[0]) importFile(e.dataTransfer.files[0]); });
 fData.add({ load: () => document.getElementById('fileInput').click() }, 'load').name('Import file… (or drop)');
+fData.add({ example: () => importBuffer('windninja_like.vtk', async () => {
+  const r = await fetch('examples/windninja_like.vtk');
+  if (!r.ok) throw new Error(`HTTP ${r.status} (serve the folder over HTTP to load examples)`);
+  return r.arrayBuffer();
+}) }, 'example').name('Load example: terrain wind');
 fData.add(params, 'exportFormat', Object.keys(FORMATS)).name('export format');
 fData.add({ save: () => exportField() }, 'save').name('Export current field');
 

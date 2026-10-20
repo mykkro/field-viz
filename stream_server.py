@@ -148,6 +148,11 @@ def docs(p):
     return send_from_directory(ROOT / "docs", p)
 
 
+@app.get("/examples/<path:p>")
+def examples(p):
+    return send_from_directory(ROOT / "examples", p)
+
+
 @app.after_request
 def cors(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
