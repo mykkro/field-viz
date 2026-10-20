@@ -33,12 +33,12 @@ server, and a Flask + ZeroMQ relay that streams time-varying data live.
 
 ## Running the examples
 
-| | What runs | Data source in the viewer | Needs |
-|---|---|---|---|
-| 1 | page only | in-browser generators | a browser |
-| 2 | `server.py` | REST API (+ in-browser) | Python 3.8+, no packages |
+|   | What runs                              | Data source in the viewer                  | Needs                               |
+| - | -------------------------------------- | ------------------------------------------ | ----------------------------------- |
+| 1 | page only                              | in-browser generators                      | a browser                           |
+| 2 | `server.py`                          | REST API (+ in-browser)                    | Python 3.8+, no packages            |
 | 3 | `stream_server.py` + `producer.py` | live WebSocket stream (+ REST, in-browser) | `pip install -r requirements.txt` |
-| 4 | `stream_server.py` + your own code | live stream of your data | same as 3 |
+| 4 | `stream_server.py` + your own code   | live stream of your data                   | same as 3                           |
 
 The page detects which backend it is talking to and adds a **data source** switch.
 three.js and lil-gui load from the jsDelivr CDN, so the page needs internet access.
@@ -106,7 +106,8 @@ from fieldstream import FieldPublisher
 pub = FieldPublisher("tcp://*:5556", dtype="float32")    # or dtype="int16"
 while simulation_running:
     v = step()                                  # numpy array, shape (nz, ny, nx, 3)
-    pub.send(v, name="My CFD run", desc="time step %d" % i, seeding="inlet")
+    pub.send(v, name="My CFD run", desc="time step %d" % i, seeding="inlet",
+             origin=(0, 0, 0), spacing=(50, 50, 20))   # optional physical geometry
 ```
 
 Then run `python stream_server.py`; it subscribes to `tcp://localhost:5556` by default, or set
@@ -118,10 +119,10 @@ public, put the Flask app behind a production server.
 
 ## REST API
 
-| Request | Response |
-|---|---|
-| `GET /api/fields` | list of generators `[{id, name, desc, seeding}]` |
-| `GET /api/fields/<id>?n=24&seed=1` | `{id, name, desc, seeding, dims:[nx,ny,nz], data:[vx,vy,vz,...]}` |
+| Request                                  | Response                                                                         |
+| ---------------------------------------- | -------------------------------------------------------------------------------- |
+| `GET /api/fields`                      | list of generators `[{id, name, desc, seeding}]`                               |
+| `GET /api/fields/<id>?n=24&seed=1`     | `{id, name, desc, seeding, dims:[nx,ny,nz], data:[vx,vy,vz,...]}`              |
 | `GET /api/fields/<id>?n=24&format=vtk` | file download; `format` = `json` \| `vtk` \| `vti` \| `npy` \| `csv` |
 
 `n` must be between 2 and 64. Generator ids: `tornado`, `sphere`, `abc`, `turbulence`, `lorenz`, `charges`, `convection`.
@@ -129,16 +130,22 @@ public, put the Flask app behind a production server.
 ## Data formats
 
 Vectors are stored point by point on a regular grid, with x varying fastest, then y, then z.
-For display the grid is always stretched to fill [-1, 1]³, so the physical origin and spacing
-stored in a file are ignored.
+The grid's physical **origin and spacing** are read from `.vtk`, `.vti`, `.csv` and `.json` and
+written back on export. `.npy` has no geometry, so it gets spacing 1.
 
-| Format | Import | Export | Notes |
-|---|---|---|---|
-| `.vtk` VTK legacy | ✓ | ✓ | `STRUCTURED_POINTS`, ASCII or BINARY; uses the first point `VECTORS` (or a 3-component `FIELD` array). Opens in ParaView/VisIt. |
-| `.vti` VTK XML ImageData | ✓ | ✓ | `ascii` or inline `binary` (uncompressed). Appended or compressed data is not supported. |
-| `.npy` NumPy | ✓ | ✓ | `float32`, shape `(nz, ny, nx, 3)`, so `a[k, j, i]` is the vector at (x_i, y_j, z_k). Shape `(3, nz, ny, nx)`, other dtypes and Fortran order are also accepted. |
-| `.csv` | ✓ | ✓ | Columns `x,y,z,vx,vy,vz`. Also accepts `u,v,w` or ParaView names (`Points:0`, `velocity:0`, ...). Rows may be in any order but must form a complete grid. |
-| `.json` | ✓ | ✓ | `{"dims":[nx,ny,nz], "data":[vx,vy,vz,...]}` |
+Domains don't have to be cubes. By default the viewer keeps the true proportions (for example
+3 km × 2 km × 240 m), scaled so the longest axis fits the view. **View → z exaggeration**
+stretches the height, and **aspect → stretch to cube** fills a cube. When an axis is stretched,
+arrows, streamlines and particles still follow the correct directions. Vorticity and divergence
+are computed in physical units.
+
+| Format                     | Import | Export | Notes                                                                                                                                                                    |
+| -------------------------- | ------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `.vtk` VTK legacy        | ✓     | ✓     | `STRUCTURED_POINTS`, ASCII or BINARY; uses the first point `VECTORS` (or a 3-component `FIELD` array). Opens in ParaView/VisIt.                                    |
+| `.vti` VTK XML ImageData | ✓     | ✓     | `ascii` or inline `binary` (uncompressed). Appended or compressed data is not supported.                                                                             |
+| `.npy` NumPy             | ✓     | ✓     | `float32`, shape `(nz, ny, nx, 3)`, so `a[k, j, i]` is the vector at (x_i, y_j, z_k). Shape `(3, nz, ny, nx)`, other dtypes and Fortran order are also accepted. |
+| `.csv`                   | ✓     | ✓     | Columns `x,y,z,vx,vy,vz`. Also accepts `u,v,w` or ParaView names (`Points:0`, `velocity:0`, ...). Rows may be in any order but must form a complete grid.        |
+| `.json`                  | ✓     | ✓     | `{"dims":[nx,ny,nz], "data":[vx,vy,vz,...]}`                                                                                                                           |
 
 Loading data from NumPy:
 

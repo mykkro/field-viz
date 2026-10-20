@@ -105,27 +105,50 @@ function cmap(name, t, out, o = 0) {
 }
 
 // ---------------------------------------------------------------------------
-// Field: regular grid over [-1,1]^3, vectors stored x-fastest, trilinear sampling
+// Field: regular grid with physical origin/spacing, vectors stored x-fastest, trilinear sampling.
+// Display ("world") box: centred at 0, longest axis spans [-1,1]; either true proportions
+// (with optional z exaggeration) or stretched to a cube. sample() takes world coordinates and
+// returns physical vectors; multiply by kn to get directions in the (possibly stretched) display.
 // ---------------------------------------------------------------------------
 class Field {
-  constructor(nx, ny, nz, data) {
-    this.nx = nx; this.ny = ny; this.nz = nz;
+  constructor(nx, ny, nz, data, origin, spacing) {
+    this.nx = nx; this.ny = ny; this.nz = nz; this.dims = [nx, ny, nz];
     this.v = data || new Float32Array(nx * ny * nz * 3);
+    this.origin = origin || [-1, -1, -1];
+    this.spacing = spacing || [2 / (nx - 1), 2 / (ny - 1), 2 / (nz - 1)];
+    this.extent = this.spacing.map((s, a) => s * (this.dims[a] - 1));
+    this.setDisplay();
   }
-  coord(i, n) { return -1 + 2 * i / (n - 1); }
-  fill(fn) {
+  setDisplay(mode = params.aspect, zex = params.zExag) {
+    const E = this.extent.map((e, a) => a === 2 ? e * zex : e), m = Math.max(...E);
+    this.hi = mode === 'stretch to cube' ? [1, 1, 1] : E.map(e => e / m);
+    this.lo = this.hi.map(h => -h);
+    const k = this.extent.map((e, a) => 2 * this.hi[a] / e), km = Math.max(...k);
+    this.k = k;                         // world units per physical unit, per axis
+    this.kn = k.map(x => x / km);       // direction mapping (1,1,1 when proportions are kept)
+  }
+  coord(i, a) { return this.lo[a] + (this.hi[a] - this.lo[a]) * i / (this.dims[a] - 1); }   // world
+  phys(i, a) { return this.origin[a] + this.spacing[a] * i; }                               // physical
+  physToWorld(p) { return p.map((c, a) => this.lo[a] + (c - this.origin[a]) * this.k[a]); }
+  normToWorld(p) { return p.map((c, a) => c * this.hi[a]); }   // [-1,1]^3 -> display box
+  fill(fn) {   // fn gets physical coordinates
     const o = [0, 0, 0]; let p = 0;
     for (let k = 0; k < this.nz; k++) for (let j = 0; j < this.ny; j++) for (let i = 0; i < this.nx; i++) {
       o[0] = o[1] = o[2] = 0;
-      fn(this.coord(i, this.nx), this.coord(j, this.ny), this.coord(k, this.nz), o);
+      fn(this.phys(i, 0), this.phys(j, 1), this.phys(k, 2), o);
       this.v[p++] = o[0]; this.v[p++] = o[1]; this.v[p++] = o[2];
     }
   }
   _cell(x, y, z) {
-    const gx = (x + 1) * 0.5 * (this.nx - 1), gy = (y + 1) * 0.5 * (this.ny - 1), gz = (z + 1) * 0.5 * (this.nz - 1);
-    if (!(gx >= 0 && gx <= this.nx - 1 && gy >= 0 && gy <= this.ny - 1 && gz >= 0 && gz <= this.nz - 1)) return null;
-    const i = Math.min(gx | 0, this.nx - 2), j = Math.min(gy | 0, this.ny - 2), k = Math.min(gz | 0, this.nz - 2);
-    return [i, j, k, gx - i, gy - j, gz - k];
+    const { lo, hi } = this;
+    const gx = (x - lo[0]) / (hi[0] - lo[0]) * (this.nx - 1), gy = (y - lo[1]) / (hi[1] - lo[1]) * (this.ny - 1),
+          gz = (z - lo[2]) / (hi[2] - lo[2]) * (this.nz - 1);
+    const e = 1e-6;   // tolerate rounding exactly on the box faces
+    if (!(gx >= -e && gx <= this.nx - 1 + e && gy >= -e && gy <= this.ny - 1 + e && gz >= -e && gz <= this.nz - 1 + e)) return null;
+    const cl = (g, n) => Math.min(Math.max(g, 0), n - 1);
+    const cx = cl(gx, this.nx), cy = cl(gy, this.ny), cz = cl(gz, this.nz);
+    const i = Math.min(cx | 0, this.nx - 2), j = Math.min(cy | 0, this.ny - 2), k = Math.min(cz | 0, this.nz - 2);
+    return [i, j, k, cx - i, cy - j, cz - k];
   }
   sample(x, y, z, out) {
     const c = this._cell(x, y, z); if (!c) return false;
@@ -152,7 +175,7 @@ class Field {
   // speed, vorticity magnitude, divergence + robust reference ranges
   computeDerived() {
     const { nx, ny, nz, v } = this, N = nx * ny * nz;
-    const hx = 2 / (nx - 1), hy = 2 / (ny - 1), hz = 2 / (nz - 1);
+    const [hx, hy, hz] = this.spacing;   // physical spacing -> vorticity/divergence in physical units
     this.speed = new Float32Array(N); this.vort = new Float32Array(N); this.div = new Float32Array(N);
     const id = (i, j, k) => (k * ny + j) * nx + i;
     const d = (c, i, j, k, ax) => {
@@ -334,6 +357,11 @@ const boxLines = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeo
   new THREE.LineBasicMaterial({ color: 0x5b6575 }));
 scene.add(boxLines);
 const axes = new THREE.AxesHelper(0.35); axes.position.set(-1, -1, -1); scene.add(axes);
+function updateBox() {   // bounding box, axes and decorations follow the display box
+  boxLines.scale.set(...field.hi); axes.position.set(...field.lo);
+  groups.decor.scale.set(...field.k);   // decorations are authored in physical coordinates
+  groups.decor.position.set(...field.lo.map((l, a) => l - field.origin[a] * field.k[a]));
+}
 
 const groups = { decor: new THREE.Group(), arrows: new THREE.Group(), lines: new THREE.Group(), particles: new THREE.Group(), slice: new THREE.Group() };
 Object.values(groups).forEach(g => scene.add(g));
@@ -348,7 +376,7 @@ function clearGroup(g) {
 // ---------------------------------------------------------------------------
 const params = {
   source: 'browser (JS)', liveMaxFps: 10, exportFormat: 'VTK legacy (.vtk)', generator: 'Tornado', resolution: 24, seed: 1, preset: 'Streamlines (animated)',
-  colormap: 'turbo', reversePalette: false, projection: 'perspective', showBox: true, autoRotate: false, background: '#0e1116',
+  colormap: 'turbo', reversePalette: false, projection: 'perspective', aspect: 'true proportions', zExag: 1, showBox: true, autoRotate: false, background: '#0e1116',
   arrows:    { show: false, stride: 2, scale: 1.0, thickness: 0.45, uniform: false, minSpeed: 0.03, region: 'volume', opacity: 1 },
   lines:     { show: true, seeding: 'auto', count: 160, step: 0.01, maxSteps: 700, both: true, tubes: false,
                radius: 0.006, animate: true, pulseSpeed: 0.5, pulseDensity: 2.0, opacity: 0.95 },
@@ -369,7 +397,7 @@ async function regenerate() {
     const r = await fetch(`${API_BASE}api/fields/${remote.id}?n=${n}&seed=${params.seed}`);
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || r.statusText);
-    field = new Field(...j.dims, Float32Array.from(j.data));
+    field = new Field(...j.dims, Float32Array.from(j.data), j.origin, j.spacing);
     // reuse local decorations (sphere, charges) / spawners by name
     gen = { ...(GENERATORS[j.name] || {}), desc: j.desc + ' [served by REST API]', seeding: j.seeding };
     genName = j.name;
@@ -383,7 +411,7 @@ async function regenerate() {
 }
 
 function rebuildAll() {
-  clearGroup(groups.decor); gen.decorate?.(groups.decor);
+  clearGroup(groups.decor); gen.decorate?.(groups.decor); updateBox();
   rebuildArrows(); rebuildLines(); resetParticles(); rebuildSlice(); updateLegend(); updateInfo();
 }
 
@@ -431,8 +459,10 @@ function applyLiveFrame(buf) {
   if (dtype === 0) data = new Float32Array(buf.slice(40, 40 + n * 4));
   else if (dtype === 1) { const q = new Int16Array(buf, 40, n); data = new Float32Array(n); for (let i = 0; i < n; i++) data[i] = q[i] * scale; }
   else throw new Error('unknown dtype ' + dtype);
-  const sameGrid = field && field.nx === nx && field.ny === ny && field.nz === nz && genName === live.meta.name;
-  field = new Field(nx, ny, nz, data); field.computeDerived();
+  const m = live.meta;   // optional physical "origin"/"spacing" come with the meta message
+  const sameGrid = field && field.nx === nx && field.ny === ny && field.nz === nz && genName === m.name && !live.metaChanged;
+  live.metaChanged = false;
+  field = new Field(nx, ny, nz, data, m.origin, m.spacing); field.computeDerived();
   // smooth the colour ranges over time so colours don't flicker frame to frame
   const r = live.refs;
   if (r && sameGrid) { field.ref = r.ref = 0.85 * r.ref + 0.15 * field.ref; field.vortRef = r.vort = 0.85 * r.vort + 0.15 * field.vortRef;
@@ -442,7 +472,6 @@ function applyLiveFrame(buf) {
   if (live.last) live.fps = 0.8 * live.fps + 200 / (now - live.last);
   live.last = now; live.frames++; live.bytes = buf.byteLength;
   live.seq = dv.getUint32(4, true); live.time = dv.getFloat64(32, true);
-  const m = live.meta;
   gen = { ...(GENERATORS[m.name] || {}), desc: (m.desc || '') + ' [live stream]', seeding: m.seeding || 'random' };
   genName = m.name || 'Live stream';
   if (!sameGrid) rebuildAll();     // new grid / scenario: full rebuild incl. particles
@@ -459,7 +488,13 @@ function applyLiveFrame(buf) {
 // ---------------------------------------------------------------------------
 const SEED_MODES = ['auto', 'random', 'inlet (−X face)', 'slice plane', 'sphere r=0.5', 'diagonal rake', 'ground ring'];
 function spawnPoint(mode, rng) {
-  if (mode === 'auto') { if (gen.spawn) return gen.spawn(rng); mode = ({ inlet: 'inlet (−X face)', ring: 'ground ring' })[gen.seeding] || 'random'; }
+  if (mode === 'auto') {
+    if (gen.spawn) return field.physToWorld(gen.spawn(rng));   // generator spawners work in physical coords
+    mode = ({ inlet: 'inlet (−X face)', ring: 'ground ring' })[gen.seeding] || 'random';
+  }
+  return field.normToWorld(spawnNorm(mode, rng));
+}
+function spawnNorm(mode, rng) {   // in the normalised box [-1,1]^3
   const u = () => rng() * 1.9 - 0.95;
   switch (mode) {
     case 'inlet (−X face)': return [-0.98, u(), u()];
@@ -485,7 +520,8 @@ const arrowGeom = (() => {
 function rebuildArrows() {
   clearGroup(groups.arrows); stats.arrows = 0;
   const A = params.arrows; if (!A.show) return;
-  const { nx, ny, nz } = field, s = A.stride, cell = 2 / (Math.max(nx, ny, nz) - 1) * s;
+  const { nx, ny, nz } = field, s = A.stride;
+  const cell = Math.min(...field.hi.map((h, a) => 2 * h / (field.dims[a] - 1))) * s;   // smallest world spacing
   const pts = [];
   const axIdx = { x: 0, y: 1, z: 2 }[params.slice.axis], dims = [nx, ny, nz];
   const sliceIdx = Math.round((params.slice.pos + 1) / 2 * (dims[axIdx] - 1));
@@ -505,12 +541,13 @@ function rebuildArrows() {
         pos = new THREE.Vector3(), scl = new THREE.Vector3(), col = new THREE.Color(), rgb = [0, 0, 0];
   for (let n = 0; n < count; n++) {
     const [p, i, j, k] = pts.slice(n * 4, n * 4 + 4), sp = field.speed[p];
-    dir.set(field.v[p*3], field.v[p*3+1], field.v[p*3+2]).divideScalar(sp);
+    const kn = field.kn;
+    dir.set(field.v[p*3] * kn[0], field.v[p*3+1] * kn[1], field.v[p*3+2] * kn[2]).normalize();
     q.setFromUnitVectors(up, dir);
     const rel = Math.min(sp / field.ref, 1.4);
     const L = A.scale * cell * (A.uniform ? 0.85 : 0.15 + 0.85 * rel);
     const w = A.scale * A.thickness * cell * (A.uniform ? 0.85 : 0.35 + 0.65 * Math.sqrt(rel));
-    pos.set(field.coord(i, nx), field.coord(j, ny), field.coord(k, nz)).addScaledVector(dir, -L / 2);
+    pos.set(field.coord(i, 0), field.coord(j, 1), field.coord(k, 2)).addScaledVector(dir, -L / 2);
     m4.compose(pos, q, scl.set(w, L, w));
     mesh.setMatrixAt(n, m4);
     cmap(params.colormap, sp / field.ref, rgb);
@@ -555,8 +592,11 @@ const lineUniforms = { uTime: { value: 0 }, uAnimate: { value: 1 }, uDensity: { 
 
 function integrate(p0, dir, h, maxSteps, eps) {
   const out = [], v = [0, 0, 0], k1 = [0,0,0], k2 = [0,0,0], k3 = [0,0,0], k4 = [0,0,0];
+  const kn = field.kn;   // physical -> display direction (non-uniform when axes are stretched)
   const unit = (x, y, z, o) => { if (!field.sample(x, y, z, o)) return false;
-    const m = Math.hypot(o[0], o[1], o[2]); if (m < eps) return false; o[0] /= m; o[1] /= m; o[2] /= m; return true; };
+    if (Math.hypot(o[0], o[1], o[2]) < eps) return false;
+    o[0] *= kn[0]; o[1] *= kn[1]; o[2] *= kn[2];
+    const m = Math.hypot(o[0], o[1], o[2]); o[0] /= m; o[1] /= m; o[2] /= m; return true; };
   if (!field.sample(p0[0], p0[1], p0[2], v)) return out;
   let [x, y, z] = p0; out.push([x, y, z, Math.hypot(...v)]);
   const H = h * dir;
@@ -707,7 +747,7 @@ function respawn(i) {
 const _v = [0, 0, 0], _rgb = [0, 0, 0];
 function updateParticles(dt) {
   if (!P) return;
-  const { N, T, hist } = P, k = params.particles.speed / field.ref * dt, eps = 1e-3 * field.ref;
+  const { N, T, hist } = P, k = params.particles.speed / field.ref * dt, eps = 1e-3 * field.ref, kn = field.kn;
   const tp = P.trails.geometry.attributes, hp = P.heads.geometry.attributes;
   for (let i = 0; i < N; i++) {
     const b = i * T * 3;
@@ -715,9 +755,9 @@ function updateParticles(dt) {
     P.age[i] += dt;
     let ok = field.sample(x, y, z, _v) && Math.hypot(..._v) > eps && P.age[i] < P.life[i];
     if (ok) { // midpoint (RK2) step
-      const mx = x + 0.5 * k * _v[0], my = y + 0.5 * k * _v[1], mz = z + 0.5 * k * _v[2];
+      const mx = x + 0.5 * k * kn[0] * _v[0], my = y + 0.5 * k * kn[1] * _v[1], mz = z + 0.5 * k * kn[2] * _v[2];
       ok = field.sample(mx, my, mz, _v);
-      if (ok) { x += k * _v[0]; y += k * _v[1]; z += k * _v[2]; ok = field.sample(x, y, z, _v); }
+      if (ok) { x += k * kn[0] * _v[0]; y += k * kn[1] * _v[1]; z += k * kn[2] * _v[2]; ok = field.sample(x, y, z, _v); }
     }
     if (!ok) { respawn(i); x = hist[b]; y = hist[b+1]; z = hist[b+2]; field.sample(x, y, z, _v); }
     hist.copyWithin(b + 3, b, b + (T - 1) * 3);
@@ -752,7 +792,7 @@ function rebuildSlice() {
   const S = params.slice; if (!S.show) return;
   const R = 160, data = new Uint8Array(R * R * 4), info = quantityInfo(S.quantity), rgb = [0, 0, 0], v = [0, 0, 0];
   const ax = { x: 0, y: 1, z: 2 }[S.axis], [ua, va] = [[1, 2], [0, 2], [0, 1]][ax];
-  const world = (u, w) => { const p = [0, 0, 0]; p[ax] = S.pos; p[ua] = u; p[va] = w; return p; };
+  const world = (u, w) => { const p = [0, 0, 0]; p[ax] = S.pos; p[ua] = u; p[va] = w; return field.normToWorld(p); };
   const comp = { vx: 0, vy: 1, vz: 2 }[S.quantity];
   for (let j = 0; j < R; j++) for (let i = 0; i < R; i++) {
     const [x, y, z] = world(-1 + 2 * i / (R - 1), -1 + 2 * j / (R - 1));
@@ -807,7 +847,7 @@ function updateInfo() {
   document.getElementById('stats').innerHTML =
     (live?.frames ? `live: frame ${live.seq} · t=${live.time.toFixed(1)}s · ${live.fps.toFixed(1)} fps · ${(live.bytes / 1024).toFixed(0)} KB/frame<br>` : '') +
     `source: ${genName === 'Custom field' ? 'file' : live ? 'WebSocket stream' : params.source === 'server API' && serverGens ? 'REST API' : 'browser'} · ` +
-    `grid ${field.nx}×${field.ny}×${field.nz} · max |v| ${field.maxSpeed.toFixed(2)} · p98 ${field.ref.toFixed(2)}<br>` +
+    `grid ${field.nx}×${field.ny}×${field.nz} · size ${field.extent.map(e => +e.toPrecision(4)).join('×')} · max |v| ${field.maxSpeed.toFixed(2)} · p98 ${field.ref.toFixed(2)}<br>` +
     (params.arrows.show ? `arrows ${stats.arrows} · ` : '') +
     (params.lines.show ? `streamlines ${stats.lines} (${stats.verts} verts) · ` : '') +
     (params.particles.show ? `particles ${params.particles.count}` : '');
@@ -864,6 +904,9 @@ fView.add(params, 'showBox').name('bounding box').onChange(v => { boxLines.visib
 fView.add(params, 'autoRotate').name('auto-rotate').onChange(v => controls.autoRotate = v);
 fView.addColor(params, 'background').onChange(v => { scene.background = new THREE.Color(v); document.body.style.background = v; });
 fView.add(params, 'projection', ['perspective', 'orthographic']).onChange(setProjection);
+const reDisplay = withBusy(() => { field.setDisplay(); rebuildAll(); });
+fView.add(params, 'aspect', ['true proportions', 'stretch to cube']).onChange(reDisplay);
+fView.add(params, 'zExag', 0.1, 20, 0.1).name('z exaggeration').onFinishChange(reDisplay);
 fView.add({ reset: () => {
   camera.position.copy(homeView()); controls.target.set(0, 0, 0);
   if (camera === orthoCam) { orthoCam.zoom = 1; orthoCam.updateProjectionMatrix(); }
@@ -946,7 +989,7 @@ const VTK_T = { float: 'f4', double: 'f8', char: 'i1', unsigned_char: 'u1', shor
 const VTI_T = { Float32: 'f4', Float64: 'f8', Int8: 'i1', UInt8: 'u1', Int16: 'i2', UInt16: 'u2',
   Int32: 'i4', UInt32: 'u4', Int64: 'i8', UInt64: 'u8' };
 const typeCode = (map, t) => { const c = map[t] || map[t?.toLowerCase()]; if (!c) throw new Error(`unsupported data type "${t}"`); return c; };
-const spacing = f => [2 / (f.nx - 1), 2 / (f.ny - 1), 2 / (f.nz - 1)].map(h => +h.toPrecision(9));
+const nums = a => a.map(h => +(+h).toPrecision(9)).join(' ');
 
 class ByteReader {
   constructor(buf) { this.u8 = new Uint8Array(buf); this.dv = new DataView(buf); this.p = 0; }
@@ -980,11 +1023,13 @@ const FORMATS = {
       if (!r.line().startsWith('# vtk')) throw new Error('missing "# vtk DataFile" header');
       r.line();   // title
       const bin = (r.next() || '').toUpperCase() === 'BINARY';
-      let dims, n = 0, cell = false, vec = null;
+      let dims, n = 0, cell = false, vec = null, origin, spacing;
       for (let l; !vec && (l = r.next()) !== null;) {
         const t = l.split(/\s+/), kw = t[0].toUpperCase();
         if (kw === 'DATASET') { if (t[1].toUpperCase() !== 'STRUCTURED_POINTS') throw new Error(`only STRUCTURED_POINTS is supported (file has ${t[1]})`); }
         else if (kw === 'DIMENSIONS') dims = t.slice(1, 4).map(Number);
+        else if (kw === 'ORIGIN') origin = t.slice(1, 4).map(Number);
+        else if (kw === 'SPACING' || kw === 'ASPECT_RATIO') spacing = t.slice(1, 4).map(Number);
         else if (kw === 'POINT_DATA' || kw === 'CELL_DATA') { n = +t[1]; cell = kw === 'CELL_DATA'; }
         else if (kw === 'VECTORS' || kw === 'NORMALS') { const v = r.values(n * 3, typeCode(VTK_T, t[2]), bin); if (kw === 'VECTORS' && !cell) vec = v; }
         else if (kw === 'SCALARS') {
@@ -1000,17 +1045,16 @@ const FORMATS = {
           }
         }
         else if (['COLOR_SCALARS', 'TEXTURE_COORDINATES', 'TENSORS'].includes(kw)) throw new Error(`unsupported section ${kw} before the vectors`);
-        // ORIGIN / SPACING / ASPECT_RATIO / METADATA lines are ignored
       }
       if (!dims) throw new Error('no DIMENSIONS found');
       if (!vec) throw new Error('no point VECTORS (or 3-component FIELD array) found');
-      return { dims, data: Float32Array.from(vec) };
+      return { dims, data: Float32Array.from(vec), origin, spacing };
     },
     write(f) {
       const N = f.nx * f.ny * f.nz, dv = new DataView(new ArrayBuffer(N * 12));
       for (let i = 0; i < N * 3; i++) dv.setFloat32(i * 4, f.v[i], false);
       return [`# vtk DataFile Version 3.0\nvector field (field-viz)\nBINARY\nDATASET STRUCTURED_POINTS\n` +
-        `DIMENSIONS ${f.nx} ${f.ny} ${f.nz}\nORIGIN -1 -1 -1\nSPACING ${spacing(f).join(' ')}\n` +
+        `DIMENSIONS ${f.nx} ${f.ny} ${f.nz}\nORIGIN ${nums(f.origin)}\nSPACING ${nums(f.spacing)}\n` +
         `POINT_DATA ${N}\nVECTORS velocity float\n`, dv.buffer, '\n'];
     },
   },
@@ -1022,14 +1066,15 @@ const FORMATS = {
       const root = doc.querySelector('VTKFile');
       if (root?.getAttribute('type') !== 'ImageData') throw new Error('not a VTK ImageData file');
       if (root.getAttribute('compressor')) throw new Error('compressed .vti is not supported (save uncompressed)');
-      const e = doc.querySelector('ImageData').getAttribute('WholeExtent').trim().split(/\s+/).map(Number);
+      const img = doc.querySelector('ImageData'), attr = k => img.getAttribute(k)?.trim().split(/\s+/).map(Number);
+      const e = attr('WholeExtent'), origin = attr('Origin'), spacing = attr('Spacing');
       const dims = [e[1] - e[0] + 1, e[3] - e[2] + 1, e[5] - e[4] + 1], N = dims[0] * dims[1] * dims[2] * 3;
       const pd = doc.querySelector('PointData'), arrays = [...(pd?.querySelectorAll('DataArray') || [])];
       const vname = pd?.getAttribute('Vectors');
       const da = arrays.find(a => vname && a.getAttribute('Name') === vname) || arrays.find(a => a.getAttribute('NumberOfComponents') === '3');
       if (!da) throw new Error('no 3-component PointData array found');
       const fmt = da.getAttribute('format');
-      if (fmt === 'ascii') return { dims, data: Float32Array.from(da.textContent.trim().split(/\s+/), Number) };
+      if (fmt === 'ascii') return { dims, data: Float32Array.from(da.textContent.trim().split(/\s+/), Number), origin, spacing };
       if (fmt !== 'binary') throw new Error('"appended" .vti data is not supported (use ascii or binary)');
       const code = typeCode(VTI_T, da.getAttribute('type')), little = root.getAttribute('byte_order') !== 'BigEndian';
       const hdr = root.getAttribute('header_type') === 'UInt64' ? 8 : 4, s = da.textContent.replace(/\s+/g, '');
@@ -1038,7 +1083,7 @@ const FORMATS = {
       const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength), data = new Float32Array(N);
       if (bytes.byteLength < N * SZ[code]) throw new Error('binary data shorter than expected');
       for (let i = 0; i < N; i++) data[i] = RD[code](dv, i * SZ[code], little);
-      return { dims, data };
+      return { dims, data, origin, spacing };
     },
     write(f) {
       const raw = new Uint8Array(4 + f.v.byteLength), dv = new DataView(raw.buffer);
@@ -1046,7 +1091,7 @@ const FORMATS = {
       for (let i = 0; i < f.v.length; i++) dv.setFloat32(4 + i * 4, f.v[i], true);
       const ext = `0 ${f.nx - 1} 0 ${f.ny - 1} 0 ${f.nz - 1}`;
       return [`<?xml version="1.0"?>\n<VTKFile type="ImageData" version="0.1" byte_order="LittleEndian" header_type="UInt32">\n` +
-        `  <ImageData WholeExtent="${ext}" Origin="-1 -1 -1" Spacing="${spacing(f).join(' ')}">\n    <Piece Extent="${ext}">\n` +
+        `  <ImageData WholeExtent="${ext}" Origin="${nums(f.origin)}" Spacing="${nums(f.spacing)}">\n    <Piece Extent="${ext}">\n` +
         `      <PointData Vectors="velocity">\n        <DataArray type="Float32" Name="velocity" NumberOfComponents="3" format="binary">\n` +
         b64encode(raw) + `\n        </DataArray>\n      </PointData>\n    </Piece>\n  </ImageData>\n</VTKFile>\n`];
     },
@@ -1108,20 +1153,22 @@ const FORMATS = {
         const p = ((mz.get(+r[2].toPrecision(7)) * ny + my.get(+r[1].toPrecision(7))) * nx + mx.get(+r[0].toPrecision(7))) * 3;
         data[p] = r[3]; data[p + 1] = r[4]; data[p + 2] = r[5];
       }
-      return { dims: [nx, ny, nz], data };
+      const sp = u => u.length > 1 ? (u[u.length - 1] - u[0]) / (u.length - 1) : 1;
+      return { dims: [nx, ny, nz], data, origin: [ux[0], uy[0], uz[0]], spacing: [sp(ux), sp(uy), sp(uz)] };
     },
     write(f) {
       const out = ['x,y,z,vx,vy,vz']; let p = 0;
       for (let k = 0; k < f.nz; k++) for (let j = 0; j < f.ny; j++) for (let i = 0; i < f.nx; i++, p += 3)
-        out.push(`${f.coord(i, f.nx).toFixed(6)},${f.coord(j, f.ny).toFixed(6)},${f.coord(k, f.nz).toFixed(6)},` +
+        out.push(`${+f.phys(i, 0).toPrecision(9)},${+f.phys(j, 1).toPrecision(9)},${+f.phys(k, 2).toPrecision(9)},` +
           `${f.v[p].toPrecision(7)},${f.v[p + 1].toPrecision(7)},${f.v[p + 2].toPrecision(7)}`);
       return [out.join('\n') + '\n'];
     },
   },
   'JSON (.json)': {
     ext: 'json', mime: 'application/json',
-    read(buf) { const j = JSON.parse(td.decode(buf)); return { dims: j.dims || [j.nx, j.ny, j.nz], data: Float32Array.from(j.data) }; },
-    write(f) { return [JSON.stringify({ dims: [f.nx, f.ny, f.nz], data: Array.from(f.v, x => +x.toFixed(5)) })]; },
+    read(buf) { const j = JSON.parse(td.decode(buf));
+      return { dims: j.dims || [j.nx, j.ny, j.nz], data: Float32Array.from(j.data), origin: j.origin, spacing: j.spacing }; },
+    write(f) { return [JSON.stringify({ dims: [f.nx, f.ny, f.nz], origin: f.origin, spacing: f.spacing, data: Array.from(f.v, x => +x.toFixed(5)) })]; },
   },
 };
 const EXT_FORMAT = { vtk: 'VTK legacy (.vtk)', vti: 'VTK XML ImageData (.vti)', npy: 'NumPy (.npy)', csv: 'CSV (.csv)', txt: 'CSV (.csv)', json: 'JSON (.json)' };
@@ -1138,10 +1185,12 @@ async function importFile(file) {
   try {
     const name = EXT_FORMAT[file.name.split('.').pop().toLowerCase()];
     if (!name) throw new Error('unknown extension (use .vtk, .vti, .npy, .csv or .json)');
-    const { dims: [nx, ny, nz], data } = FORMATS[name].read(await file.arrayBuffer());
+    const { dims: [nx, ny, nz], data, origin, spacing } = FORMATS[name].read(await file.arrayBuffer());
     if (!(nx >= 2 && ny >= 2 && nz >= 2)) throw new Error(`grid must be at least 2 points per axis (got ${nx}×${ny}×${nz})`);
     if (data.length !== nx * ny * nz * 3) throw new Error(`expected ${nx * ny * nz * 3} values, got ${data.length}`);
-    field = new Field(nx, ny, nz, data); field.computeDerived();
+    // formats without geometry (.npy) get unit spacing, so the box follows the grid dimensions
+    const sp = spacing?.length === 3 && spacing.every(s => s > 0) ? spacing : [1, 1, 1];
+    field = new Field(nx, ny, nz, data, origin?.length === 3 ? origin : [0, 0, 0], sp); field.computeDerived();
     gen = { desc: `Loaded from ${file.name} (${name}).`, seeding: 'random' }; genName = 'Custom field';
     rebuildAll();
   } catch (err) { alert(`Could not load ${file.name}: ${err.message}`); }

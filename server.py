@@ -207,7 +207,8 @@ def build_field(gen_id, n, seed):
         for y in coords:
             for x in coords:
                 data.extend(round(v, 5) for v in f(x, y, z))
-    return {"id": gen_id, "name": name, "desc": desc, "seeding": seeding, "dims": [n, n, n], "data": data}
+    return {"id": gen_id, "name": name, "desc": desc, "seeding": seeding, "dims": [n, n, n],
+            "origin": [-1, -1, -1], "spacing": [2 / (n - 1)] * 3, "data": data}
 
 
 def list_generators():

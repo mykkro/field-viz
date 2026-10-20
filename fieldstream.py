@@ -17,7 +17,8 @@ Frame layout (little-endian), 40-byte header followed by the payload:
                      == a C-ordered numpy array of shape (nz, ny, nx, 3)
 
 ZeroMQ message = two parts: [meta JSON (utf-8), frame bytes].
-meta: {"name": str, "desc": str, "seeding": "random"|"inlet"|"ring"} (resent with every frame; tiny).
+meta: {"name": str, "desc": str, "seeding": "random"|"inlet"|"ring",
+       "origin": [x0,y0,z0], "spacing": [dx,dy,dz]}   (origin/spacing optional; resent with every frame)
 
 Usage from your own code:
 
@@ -81,7 +82,13 @@ class FieldPublisher:
         self.dtype = dtype
         self.seq = 0
 
-    def send(self, v, name="Live field", desc="", seeding="random", timestamp=None):
-        meta = json.dumps({"name": name, "desc": desc, "seeding": seeding}).encode()
+    def send(self, v, name="Live field", desc="", seeding="random", timestamp=None, origin=None, spacing=None):
+        """origin/spacing: physical grid geometry (x, y, z); default is the cube [-1,1]^3."""
+        meta = {"name": name, "desc": desc, "seeding": seeding}
+        if origin is not None:
+            meta["origin"] = [float(c) for c in origin]
+        if spacing is not None:
+            meta["spacing"] = [float(c) for c in spacing]
+        meta = json.dumps(meta).encode()
         self.sock.send_multipart([meta, encode_frame(v, self.seq, self.dtype, timestamp)])
         self.seq += 1
