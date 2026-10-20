@@ -1,0 +1,271 @@
+"""Minimal REST backend serving synthetic 3D vector fields (Python stdlib only).
+
+Run:   python server.py [port]        (default port 8000)
+Open:  http://localhost:8000/
+
+Endpoints
+  GET /api/fields                       -> list of available generators
+  GET /api/fields/<id>?n=24&seed=1      -> {"id","name","desc","seeding","dims":[nx,ny,nz],"data":[vx,vy,vz,...]}
+      data is flattened x-fastest, then y, then z; the grid spans [-1,1] on every axis.
+  GET /api/fields/<id>?...&format=vtk   -> file download; format = json | vtk | vti | npy | csv
+Everything else is served as static files from this directory (index.html etc.).
+"""
+import base64
+import json
+import math
+import random
+import struct
+import sys
+from array import array
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+ROOT = Path(__file__).resolve().parent
+MAX_N = 64
+
+# ---------------------------------------------------------------------------
+# Generators: make(seed) -> f(x, y, z) -> (vx, vy, vz), domain [-1,1]^3, z is up
+# ---------------------------------------------------------------------------
+
+def tornado(_seed):
+    def f(x, y, z):
+        r = math.hypot(x, y) + 1e-6
+        h = (z + 1) / 2
+        rc = 0.16 + 0.12 * h
+        vt = 0.35 * (1 - math.exp(-r * r / (rc * rc))) / r * (0.7 + 0.3 * h)
+        vr = -0.9 * r * math.exp(-h * 6) + 0.7 * r * math.exp(-(1 - h) * 6)
+        core = math.exp(-r * r / (rc * rc * 2.5))
+        return ((-y * vt + x * vr) / r, (x * vt + y * vr) / r,
+                1.5 * core * (0.4 + 0.6 * h) - 0.12 * (1 - core))
+    return f
+
+
+SPHERE_R = 0.35
+
+def sphere_flow(_seed):
+    a3 = SPHERE_R ** 3
+    def f(x, y, z):
+        r2 = x * x + y * y + z * z
+        r = math.sqrt(r2)
+        if r < SPHERE_R:
+            return (0.0, 0.0, 0.0)
+        r3 = r2 * r
+        k = 1.5 * a3 * x / (r3 * r2)
+        return (1 + a3 / (2 * r3) - k * x, -k * y, -k * z)
+    return f
+
+
+def abc_flow(_seed):
+    A, B, C, k = 1.0, math.sqrt(2 / 3), math.sqrt(1 / 3), math.pi
+    def f(x, y, z):
+        return (A * math.sin(k * z) + C * math.cos(k * y),
+                B * math.sin(k * x) + A * math.cos(k * z),
+                C * math.sin(k * y) + B * math.cos(k * x))
+    return f
+
+
+def _rand_dir(rng):
+    z = rng.uniform(-1, 1)
+    a = rng.uniform(0, 2 * math.pi)
+    r = math.sqrt(1 - z * z)
+    return (r * math.cos(a), r * math.sin(a), z)
+
+
+def curl_noise(seed):
+    rng = random.Random(seed)
+    modes = []
+    for _ in range(10):
+        km = 2 + rng.random() * 5
+        k = tuple(c * km for c in _rand_dir(rng))
+        amp = 0.55 / km * (0.6 + 0.8 * rng.random())
+        a = tuple(c * amp for c in _rand_dir(rng))
+        # curl(a sin(k.p + phi)) = (k x a) cos(k.p + phi)  -> divergence free
+        c = (k[1] * a[2] - k[2] * a[1], k[2] * a[0] - k[0] * a[2], k[0] * a[1] - k[1] * a[0])
+        modes.append((k, c, rng.random() * 2 * math.pi))
+    def f(x, y, z):
+        vx, vy, vz = 0.8, 0.0, 0.0
+        for k, c, ph in modes:
+            w = math.cos(k[0] * x + k[1] * y + k[2] * z + ph)
+            vx += c[0] * w; vy += c[1] * w; vz += c[2] * w
+        return (vx, vy, vz)
+    return f
+
+
+def lorenz(_seed):
+    def f(x, y, z):
+        X, Y, Z = x * 22, y * 28, (z + 1) * 25
+        return (10 * (Y - X) / 22, (X * (28 - Z) - Y) / 28, (X * Y - 8 / 3 * Z) / 25)
+    return f
+
+
+CHARGES = [(0.5, 0.3, 0, 1), (-0.5, 0.3, 0, -1), (0, -0.45, 0.4, 0.7), (0, -0.45, -0.4, -0.7)]
+
+def charges(_seed):
+    def f(x, y, z):
+        vx = vy = vz = 0.0
+        for cx, cy, cz, q in CHARGES:
+            dx, dy, dz = x - cx, y - cy, z - cz
+            r2 = dx * dx + dy * dy + dz * dz + 0.004
+            s = q / (r2 * math.sqrt(r2))
+            vx += s * dx; vy += s * dy; vz += s * dz
+        return (vx, vy, vz)
+    return f
+
+
+def convection(_seed):
+    P = math.pi
+    def f(x, y, z):
+        zz = (z + 1) / 2
+        return (-math.sin(1.5 * P * x) * math.cos(P * zz) * 0.9,
+                0.25 * math.sin(P * y) * math.sin(P * zz) + 0.1 * math.cos(1.5 * P * x),
+                0.9 * math.cos(1.5 * P * x) * math.sin(P * zz))
+    return f
+
+
+# id -> (display name, description, default seeding, factory). Names match the front end.
+GENERATORS = {
+    "tornado": ("Tornado", "Swirling vortex with central updraft, ground inflow and outflow aloft.", "ring", tornado),
+    "sphere": ("Flow past sphere", "Potential flow along +X around a solid sphere.", "inlet", sphere_flow),
+    "abc": ("ABC flow", "Arnold-Beltrami-Childress flow with chaotic streamlines.", "random", abc_flow),
+    "turbulence": ("Turbulent wind (curl noise)", "Mean wind plus divergence-free random eddies.", "inlet", curl_noise),
+    "lorenz": ("Lorenz attractor", "Lorenz system rescaled into the box.", "random", lorenz),
+    "charges": ("Charges (sources & sinks)", "Coulomb-like field of two sources and two sinks.", "charges", charges),
+    "convection": ("Convection rolls", "Rayleigh-Benard style counter-rotating convection cells.", "random", convection),
+}
+
+
+def _float32_bytes(values, big_endian=False):
+    arr = array("f", values)
+    if (sys.byteorder == "little") == big_endian:
+        arr.byteswap()
+    return arr.tobytes()
+
+
+def to_vtk(field):
+    """VTK legacy STRUCTURED_POINTS, binary (big-endian float32)."""
+    nx, ny, nz = field["dims"]
+    h = " ".join(f"{2 / (d - 1):.9g}" for d in field["dims"])
+    head = (f"# vtk DataFile Version 3.0\n{field['name']}\nBINARY\nDATASET STRUCTURED_POINTS\n"
+            f"DIMENSIONS {nx} {ny} {nz}\nORIGIN -1 -1 -1\nSPACING {h}\n"
+            f"POINT_DATA {nx * ny * nz}\nVECTORS velocity float\n")
+    return head.encode() + _float32_bytes(field["data"], big_endian=True) + b"\n"
+
+
+def to_vti(field):
+    """VTK XML ImageData with inline base64 binary (UInt32 header + little-endian float32)."""
+    nx, ny, nz = field["dims"]
+    raw = _float32_bytes(field["data"])
+    payload = base64.b64encode(struct.pack("<I", len(raw)) + raw).decode()
+    ext = f"0 {nx - 1} 0 {ny - 1} 0 {nz - 1}"
+    h = " ".join(f"{2 / (d - 1):.9g}" for d in field["dims"])
+    return (f'<?xml version="1.0"?>\n<VTKFile type="ImageData" version="0.1" byte_order="LittleEndian" header_type="UInt32">\n'
+            f'  <ImageData WholeExtent="{ext}" Origin="-1 -1 -1" Spacing="{h}">\n    <Piece Extent="{ext}">\n'
+            f'      <PointData Vectors="velocity">\n'
+            f'        <DataArray type="Float32" Name="velocity" NumberOfComponents="3" format="binary">\n{payload}\n'
+            f'        </DataArray>\n      </PointData>\n    </Piece>\n  </ImageData>\n</VTKFile>\n').encode()
+
+
+def to_npy(field):
+    """NumPy .npy, float32, shape (nz, ny, nx, 3) -> a[k, j, i, :]."""
+    nx, ny, nz = field["dims"]
+    header = f"{{'descr': '<f4', 'fortran_order': False, 'shape': ({nz}, {ny}, {nx}, 3), }}"
+    total = -(-(10 + len(header) + 1) // 64) * 64
+    header = header.ljust(total - 10 - 1) + "\n"
+    return b"\x93NUMPY\x01\x00" + struct.pack("<H", len(header)) + header.encode() + _float32_bytes(field["data"])
+
+
+def to_csv(field):
+    nx, ny, nz = field["dims"]
+    d = field["data"]
+    lines = ["x,y,z,vx,vy,vz"]
+    p = 0
+    for k in range(nz):
+        for j in range(ny):
+            for i in range(nx):
+                lines.append(f"{-1 + 2 * i / (nx - 1):.6f},{-1 + 2 * j / (ny - 1):.6f},{-1 + 2 * k / (nz - 1):.6f},"
+                             f"{d[p]:.7g},{d[p + 1]:.7g},{d[p + 2]:.7g}")
+                p += 3
+    return ("\n".join(lines) + "\n").encode()
+
+
+# format -> (writer, content type, file extension); json is handled separately
+FORMATS = {
+    "vtk": (to_vtk, "application/octet-stream", "vtk"),
+    "vti": (to_vti, "application/xml", "vti"),
+    "npy": (to_npy, "application/octet-stream", "npy"),
+    "csv": (to_csv, "text/csv", "csv"),
+}
+
+
+def build_field(gen_id, n, seed):
+    name, desc, seeding, make = GENERATORS[gen_id]
+    f = make(seed)
+    coords = [-1 + 2 * i / (n - 1) for i in range(n)]
+    data = []
+    for z in coords:
+        for y in coords:
+            for x in coords:
+                data.extend(round(v, 5) for v in f(x, y, z))
+    return {"id": gen_id, "name": name, "desc": desc, "seeding": seeding, "dims": [n, n, n], "data": data}
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+class Handler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(ROOT), **kwargs)
+
+    def end_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        super().end_headers()
+
+    def send_json(self, obj, status=200):
+        body = json.dumps(obj, separators=(",", ":")).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        url = urlparse(self.path)
+        parts = [p for p in url.path.split("/") if p]
+        if parts[:2] != ["api", "fields"]:
+            return super().do_GET()
+        if len(parts) == 2:
+            return self.send_json([{"id": k, "name": v[0], "desc": v[1], "seeding": v[2]}
+                                   for k, v in GENERATORS.items()])
+        if len(parts) == 3 and parts[2] in GENERATORS:
+            q = parse_qs(url.query)
+            try:
+                n = int(q.get("n", ["24"])[0])
+                seed = int(q.get("seed", ["1"])[0])
+            except ValueError:
+                return self.send_json({"error": "n and seed must be integers"}, 400)
+            if not 2 <= n <= MAX_N:
+                return self.send_json({"error": f"n must be in [2, {MAX_N}]"}, 400)
+            fmt = q.get("format", ["json"])[0]
+            if fmt != "json" and fmt not in FORMATS:
+                return self.send_json({"error": f"format must be one of json, {', '.join(FORMATS)}"}, 400)
+            field = build_field(parts[2], n, seed)
+            if fmt == "json":
+                return self.send_json(field)
+            writer, ctype, ext = FORMATS[fmt]
+            body = writer(field)
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Disposition", f'attachment; filename="{parts[2]}_{n}x{n}x{n}.{ext}"')
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        return self.send_json({"error": "not found"}, 404)
+
+
+if __name__ == "__main__":
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+    print(f"Serving on http://localhost:{port}/  (API: /api/fields)")
+    ThreadingHTTPServer(("", port), Handler).serve_forever()

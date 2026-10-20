@@ -1,0 +1,1131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vector Field Viewer</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { --bg:#0e1116; --panel:rgba(16,20,27,.82); --fg:#dfe3ea; --muted:#9aa4b2; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font:13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; overflow:hidden; }
+  canvas#view { display:block; }
+  .panel { position:absolute; background:var(--panel); border-radius:8px; padding:10px 12px;
+    backdrop-filter:blur(4px); box-shadow:0 2px 12px rgba(0,0,0,.35); }
+  #info { left:12px; top:12px; max-width:360px; }
+  #info h1 { font-size:15px; margin:0 0 4px; font-weight:600; }
+  #info p { margin:0 0 6px; color:var(--muted); }
+  #info .stats { font:11px/1.4 ui-monospace, Consolas, monospace; color:var(--muted); }
+  #info .hint { font-size:11px; color:#6f7987; margin-top:6px; }
+  #legend { left:12px; bottom:12px; }
+  .lg + .lg { margin-top:8px; }
+  .lg .title { font-size:11px; color:var(--muted); margin-bottom:3px; }
+  .lg canvas { display:block; width:220px; height:12px; border-radius:2px; }
+  .lg .ticks { display:flex; justify-content:space-between; font:11px ui-monospace, Consolas, monospace; color:var(--muted); }
+  #busy { left:50%; top:12px; transform:translateX(-50%); display:none; }
+  canvas#view { touch-action:none; }
+  #info h1 { cursor:pointer; user-select:none; }
+  #info h1::after { content:' ▾'; color:var(--muted); font-size:11px; }
+  #info.collapsed h1 { margin:0; }
+  #info.collapsed h1::after { content:' ▸'; }
+  #info.collapsed p, #info.collapsed .stats, #info.collapsed .hint { display:none; }
+  .lil-gui.root { max-height:calc(100vh - 24px); max-height:calc(100dvh - 24px); overflow-y:auto; }
+  @media (max-width:640px), (pointer:coarse) and (max-height:500px) {
+    body { font-size:12px; }
+    .panel { padding:8px 10px; }
+    /* info moves to the bottom (above the legend) so it doesn't collide with the controls */
+    #info { top:auto; left:8px; bottom:62px; max-width:calc(100vw - 32px); }
+    #info .hint { display:none; }
+    #legend { left:8px; bottom:8px; }
+    .lg canvas { width:160px; }
+    .lil-gui.root { --widget-height:26px; --font-size:12px; --input-font-size:13px;
+      max-height:calc(100dvh - 140px); }
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+    "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19.2/dist/lil-gui.esm.js"
+  }
+}
+</script>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="info" class="panel">
+  <h1 id="genName"></h1>
+  <p id="genDesc"></p>
+  <div class="stats" id="stats"></div>
+  <div class="hint">Left-drag: orbit · Right-drag: pan · Wheel: zoom · Touch: 1 finger orbit, 2 fingers zoom/pan · Drop a .vtk/.vti/.npy/.csv/.json file to load it</div>
+</div>
+<div id="legend" class="panel"></div>
+<div id="busy" class="panel">Computing…</div>
+<input type="file" id="fileInput" accept=".vtk,.vti,.npy,.csv,.txt,.json" hidden>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import GUI from 'lil-gui';
+
+// ---------------------------------------------------------------------------
+// Colormaps (sRGB stops, linearly interpolated into a 256-entry LUT)
+// ---------------------------------------------------------------------------
+const CMAP_STOPS = {
+  turbo:    ['#30123b','#4662d7','#36aaf9','#1ae4b6','#72fe5e','#c8ef34','#faba39','#f66b19','#ca2a04','#7a0403'],
+  viridis:  ['#440154','#482878','#3e4989','#31688e','#26828e','#1f9e89','#35b779','#6ece58','#b5de2b','#fde725'],
+  plasma:   ['#0d0887','#46039f','#7201a8','#9c179e','#bd3786','#d8576b','#ed7953','#fb9f3a','#fdca26','#f0f921'],
+  inferno:  ['#000004','#1b0c41','#4a0c6b','#781c6d','#a52c60','#cf4446','#ed6925','#fb9b06','#f7d13d','#fcffa4'],
+  magma:    ['#000004','#180f3d','#440f76','#721f81','#9e2f7f','#cd4071','#f1605d','#fd9668','#feca8d','#fcfdbf'],
+  cividis:  ['#00224e','#123570','#3b496c','#575d6d','#707173','#8a8678','#a59c74','#c3b369','#e1cc55','#fee838'],
+  jet:      ['#00007f','#0000ff','#007fff','#00ffff','#7fff7f','#ffff00','#ff7f00','#ff0000','#7f0000'],
+  ice:      ['#04061a','#1b2a5c','#2a5d9a','#3f93c4','#7cc6dc','#c9eef2','#ffffff'],
+  greys:    ['#202020','#ffffff'],
+  coolwarm: ['#3b4cc0','#6788ee','#9abbff','#c9d7f0','#edd1c2','#f7a889','#e26952','#b40426'],
+  RdBu:     ['#053061','#2166ac','#4393c3','#92c5de','#d1e5f0','#f7f7f7','#fddbc7','#f4a582','#d6604d','#b2182b','#67001f'],
+  PiYG:     ['#8e0152','#c51b7d','#de77ae','#f1b6da','#fde0ef','#f7f7f7','#e6f5d0','#b8e186','#7fbc41','#4d9221','#276419'],
+};
+const hexRGB = h => [parseInt(h.slice(1,3),16)/255, parseInt(h.slice(3,5),16)/255, parseInt(h.slice(5,7),16)/255];
+const LUTS = {};
+for (const [name, stops] of Object.entries(CMAP_STOPS)) {
+  const c = stops.map(hexRGB), lut = new Float32Array(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255 * (c.length - 1), a = Math.min(Math.floor(t), c.length - 2), f = t - a;
+    for (let k = 0; k < 3; k++) lut[i*3+k] = c[a][k] * (1 - f) + c[a+1][k] * f;
+  }
+  LUTS[name] = lut;
+}
+function cmap(name, t, out, o = 0) {
+  if (params.reversePalette) t = 1 - (t || 0);
+  const lut = LUTS[name], i = Math.max(0, Math.min(255, Math.round((t || 0) * 255))) * 3;
+  out[o] = lut[i]; out[o+1] = lut[i+1]; out[o+2] = lut[i+2];
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Field: regular grid over [-1,1]^3, vectors stored x-fastest, trilinear sampling
+// ---------------------------------------------------------------------------
+class Field {
+  constructor(nx, ny, nz, data) {
+    this.nx = nx; this.ny = ny; this.nz = nz;
+    this.v = data || new Float32Array(nx * ny * nz * 3);
+  }
+  coord(i, n) { return -1 + 2 * i / (n - 1); }
+  fill(fn) {
+    const o = [0, 0, 0]; let p = 0;
+    for (let k = 0; k < this.nz; k++) for (let j = 0; j < this.ny; j++) for (let i = 0; i < this.nx; i++) {
+      o[0] = o[1] = o[2] = 0;
+      fn(this.coord(i, this.nx), this.coord(j, this.ny), this.coord(k, this.nz), o);
+      this.v[p++] = o[0]; this.v[p++] = o[1]; this.v[p++] = o[2];
+    }
+  }
+  _cell(x, y, z) {
+    const gx = (x + 1) * 0.5 * (this.nx - 1), gy = (y + 1) * 0.5 * (this.ny - 1), gz = (z + 1) * 0.5 * (this.nz - 1);
+    if (!(gx >= 0 && gx <= this.nx - 1 && gy >= 0 && gy <= this.ny - 1 && gz >= 0 && gz <= this.nz - 1)) return null;
+    const i = Math.min(gx | 0, this.nx - 2), j = Math.min(gy | 0, this.ny - 2), k = Math.min(gz | 0, this.nz - 2);
+    return [i, j, k, gx - i, gy - j, gz - k];
+  }
+  sample(x, y, z, out) {
+    const c = this._cell(x, y, z); if (!c) return false;
+    const [i, j, k, fx, fy, fz] = c, nx = this.nx, v = this.v;
+    const dx = 3, dy = nx * 3, dz = nx * this.ny * 3, b = (k * nx * this.ny + j * nx + i) * 3;
+    for (let q = 0; q < 3; q++) {
+      const p = b + q;
+      const c00 = v[p] + (v[p+dx] - v[p]) * fx,       c10 = v[p+dy] + (v[p+dy+dx] - v[p+dy]) * fx;
+      const c01 = v[p+dz] + (v[p+dz+dx] - v[p+dz]) * fx, c11 = v[p+dz+dy] + (v[p+dz+dy+dx] - v[p+dz+dy]) * fx;
+      const c0 = c00 + (c10 - c00) * fy, c1 = c01 + (c11 - c01) * fy;
+      out[q] = c0 + (c1 - c0) * fz;
+    }
+    return true;
+  }
+  sampleScalar(s, x, y, z) {
+    const c = this._cell(x, y, z); if (!c) return NaN;
+    const [i, j, k, fx, fy, fz] = c, nx = this.nx;
+    const dy = nx, dz = nx * this.ny, p = k * dz + j * nx + i;
+    const c00 = s[p] + (s[p+1] - s[p]) * fx,       c10 = s[p+dy] + (s[p+dy+1] - s[p+dy]) * fx;
+    const c01 = s[p+dz] + (s[p+dz+1] - s[p+dz]) * fx, c11 = s[p+dz+dy] + (s[p+dz+dy+1] - s[p+dz+dy]) * fx;
+    const c0 = c00 + (c10 - c00) * fy, c1 = c01 + (c11 - c01) * fy;
+    return c0 + (c1 - c0) * fz;
+  }
+  // speed, vorticity magnitude, divergence + robust reference ranges
+  computeDerived() {
+    const { nx, ny, nz, v } = this, N = nx * ny * nz;
+    const hx = 2 / (nx - 1), hy = 2 / (ny - 1), hz = 2 / (nz - 1);
+    this.speed = new Float32Array(N); this.vort = new Float32Array(N); this.div = new Float32Array(N);
+    const id = (i, j, k) => (k * ny + j) * nx + i;
+    const d = (c, i, j, k, ax) => {
+      let a, b, h;
+      if (ax === 0) { a = id(Math.min(i+1, nx-1), j, k); b = id(Math.max(i-1, 0), j, k); h = (Math.min(i+1, nx-1) - Math.max(i-1, 0)) * hx; }
+      else if (ax === 1) { a = id(i, Math.min(j+1, ny-1), k); b = id(i, Math.max(j-1, 0), k); h = (Math.min(j+1, ny-1) - Math.max(j-1, 0)) * hy; }
+      else { a = id(i, j, Math.min(k+1, nz-1)); b = id(i, j, Math.max(k-1, 0)); h = (Math.min(k+1, nz-1) - Math.max(k-1, 0)) * hz; }
+      return (v[a*3+c] - v[b*3+c]) / h;
+    };
+    for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+      const p = id(i, j, k);
+      this.speed[p] = Math.hypot(v[p*3], v[p*3+1], v[p*3+2]);
+      const wx = d(2, i, j, k, 1) - d(1, i, j, k, 2);
+      const wy = d(0, i, j, k, 2) - d(2, i, j, k, 0);
+      const wz = d(1, i, j, k, 0) - d(0, i, j, k, 1);
+      this.vort[p] = Math.hypot(wx, wy, wz);
+      this.div[p] = d(0, i, j, k, 0) + d(1, i, j, k, 1) + d(2, i, j, k, 2);
+    }
+    const pct = (arr, q) => { const s = Float32Array.from(arr).sort(); return s[Math.min(s.length - 1, Math.floor(q * s.length))]; };
+    this.maxSpeed = pct(this.speed, 1);
+    this.ref = pct(this.speed, 0.98) || 1;   // robust colour range (ignores singular spikes)
+    this.vortRef = pct(this.vort, 0.98) || 1;
+    this.divRef = Math.max(Math.abs(pct(this.div, 0.02)), Math.abs(pct(this.div, 0.98))) || 1;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic generators. fn(x,y,z,out) in domain [-1,1]^3 (z is "up").
+// ---------------------------------------------------------------------------
+function mulberry32(a) {
+  return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+const randDir = rng => { const z = rng() * 2 - 1, a = rng() * Math.PI * 2, r = Math.sqrt(1 - z*z); return [r*Math.cos(a), r*Math.sin(a), z]; };
+
+const SPHERE_R = 0.35;
+const CHARGES = [[0.5, 0.3, 0, 1], [-0.5, 0.3, 0, -1], [0, -0.45, 0.4, 0.7], [0, -0.45, -0.4, -0.7]];
+
+const GENERATORS = {
+  'Tornado': {
+    desc: 'Swirling vortex with a central updraft, ground-level inflow and outflow aloft. Classic air-flow structure.',
+    seeding: 'ring',
+    make: () => (x, y, z, o) => {
+      const r = Math.hypot(x, y) + 1e-6, h = (z + 1) / 2, rc = 0.16 + 0.12 * h;
+      const vt = 0.35 * (1 - Math.exp(-r*r / (rc*rc))) / r * (0.7 + 0.3 * h);
+      const vr = -0.9 * r * Math.exp(-h * 6) + 0.7 * r * Math.exp(-(1 - h) * 6);
+      const core = Math.exp(-r*r / (rc*rc*2.5));
+      o[0] = (-y * vt + x * vr) / r;
+      o[1] = ( x * vt + y * vr) / r;
+      o[2] = 1.5 * core * (0.4 + 0.6 * h) - 0.12 * (1 - core);
+    },
+  },
+  'Flow past sphere': {
+    desc: 'Ideal (potential) uniform flow along +X around a solid sphere — stagnation points front and back, acceleration over the sides.',
+    seeding: 'inlet',
+    make: () => (x, y, z, o) => {
+      const a3 = SPHERE_R ** 3, r2 = x*x + y*y + z*z, r = Math.sqrt(r2);
+      if (r < SPHERE_R) return;
+      const r3 = r2 * r, r5 = r3 * r2, f = 1.5 * a3 * x / r5;
+      o[0] = 1 + a3 / (2 * r3) - f * x;
+      o[1] = -f * y;
+      o[2] = -f * z;
+    },
+    decorate: g => g.add(new THREE.Mesh(new THREE.SphereGeometry(SPHERE_R * 0.97, 48, 32),
+      new THREE.MeshStandardMaterial({ color: 0x8a93a3, roughness: 0.6, metalness: 0.1 }))),
+  },
+  'ABC flow': {
+    desc: 'Arnold–Beltrami–Childress flow: an exact steady Euler solution with chaotic streamlines and helical tubes.',
+    seeding: 'random',
+    make: () => { const A = 1, B = Math.sqrt(2/3), C = Math.sqrt(1/3), k = Math.PI;
+      return (x, y, z, o) => {
+        o[0] = A * Math.sin(k*z) + C * Math.cos(k*y);
+        o[1] = B * Math.sin(k*x) + A * Math.cos(k*z);
+        o[2] = C * Math.sin(k*y) + B * Math.cos(k*x);
+      }; },
+  },
+  'Turbulent wind (curl noise)': {
+    desc: 'Mean wind along +X plus divergence-free random eddies (curl of a random vector potential). Change the seed for a new realisation.',
+    seeding: 'inlet',
+    make: seed => {
+      const rng = mulberry32(seed * 9973 + 17), modes = [];
+      for (let m = 0; m < 10; m++) {
+        const km = 2 + rng() * 5, kd = randDir(rng), k = kd.map(c => c * km);
+        const ad = randDir(rng), amp = 0.55 / km * (0.6 + 0.8 * rng());
+        const a = ad.map(c => c * amp);
+        // curl( a sin(k·p+φ) ) = (k × a) cos(k·p+φ)
+        modes.push({ k, c: [k[1]*a[2] - k[2]*a[1], k[2]*a[0] - k[0]*a[2], k[0]*a[1] - k[1]*a[0]], ph: rng() * 6.283 });
+      }
+      return (x, y, z, o) => {
+        o[0] = 0.8; o[1] = 0; o[2] = 0;
+        for (const m of modes) {
+          const c = Math.cos(m.k[0]*x + m.k[1]*y + m.k[2]*z + m.ph);
+          o[0] += m.c[0] * c; o[1] += m.c[1] * c; o[2] += m.c[2] * c;
+        }
+      };
+    },
+  },
+  'Lorenz attractor': {
+    desc: 'The Lorenz system (σ=10, ρ=28, β=8/3) rescaled into the box. Streamlines wind onto the famous butterfly attractor.',
+    seeding: 'random',
+    make: () => (x, y, z, o) => {
+      const X = x * 22, Y = y * 28, Z = (z + 1) * 25;
+      o[0] = 10 * (Y - X) / 22;
+      o[1] = (X * (28 - Z) - Y) / 28;
+      o[2] = (X * Y - 8/3 * Z) / 25;
+    },
+  },
+  'Charges (sources & sinks)': {
+    desc: 'Coulomb-like field of two sources (red) and two sinks (blue). Streamlines become field lines running from + to −.',
+    seeding: 'charges',
+    make: () => (x, y, z, o) => {
+      for (const [cx, cy, cz, q] of CHARGES) {
+        const dx = x - cx, dy = y - cy, dz = z - cz, r2 = dx*dx + dy*dy + dz*dz + 0.004, f = q / (r2 * Math.sqrt(r2));
+        o[0] += f * dx; o[1] += f * dy; o[2] += f * dz;
+      }
+    },
+    decorate: g => { for (const [x, y, z, q] of CHARGES) {
+      const m = new THREE.Mesh(new THREE.SphereGeometry(0.035, 24, 16),
+        new THREE.MeshStandardMaterial({ color: q > 0 ? 0xff5a4e : 0x4e8dff, emissive: q > 0 ? 0x551410 : 0x102855 }));
+      m.position.set(x, y, z); g.add(m); } },
+    spawn: rng => {
+      const pos = CHARGES.filter(c => c[3] > 0), tot = pos.reduce((s, c) => s + c[3], 0);
+      let u = rng() * tot, c = pos[0]; for (const p of pos) { if ((u -= p[3]) <= 0) { c = p; break; } }
+      const d = randDir(rng); return [c[0] + d[0] * 0.07, c[1] + d[1] * 0.07, c[2] + d[2] * 0.07];
+    },
+  },
+  'Convection rolls': {
+    desc: 'Rayleigh–Bénard style counter-rotating convection cells with a slow cross-roll drift — warm air rising, cool air sinking.',
+    seeding: 'random',
+    make: () => (x, y, z, o) => {
+      const P = Math.PI, zz = (z + 1) / 2;
+      o[0] = -Math.sin(1.5 * P * x) * Math.cos(P * zz) * 0.9;
+      o[2] =  1.5 / 1 * Math.cos(1.5 * P * x) * Math.sin(P * zz) * 0.6;
+      o[1] = 0.25 * Math.sin(P * y) * Math.sin(P * zz) + 0.1 * Math.cos(1.5 * P * x);
+    },
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Renderer / scene
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById('view');
+const isMobile = matchMedia('(max-width: 640px), (pointer: coarse)').matches;
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, isMobile ? 1.5 : 2));
+const scene = new THREE.Scene();
+const perspCam = new THREE.PerspectiveCamera(45, 1, 0.01, 100);
+const orthoCam = new THREE.OrthographicCamera(-1, 1, 1, -1, -100, 100);
+let camera = perspCam;
+camera.up.set(0, 0, 1); orthoCam.up.set(0, 0, 1);
+// default view; pull back on portrait screens so the whole box fits horizontally
+const homeView = () => new THREE.Vector3(3.0, -2.6, 1.9).multiplyScalar(Math.max(1, 0.85 * innerHeight / innerWidth));
+camera.position.copy(homeView());
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x334055, 1.4));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6); sun.position.set(1, 0.5, 2); camera.add(sun); scene.add(perspCam, orthoCam);
+
+// Swap camera type while keeping the same view; ortho frustum matches the perspective view at the target distance.
+function setProjection(type) {
+  const next = type === 'orthographic' ? orthoCam : perspCam;
+  if (next === camera) return;
+  const dist = camera.position.distanceTo(controls.target);
+  next.position.copy(camera.position); next.quaternion.copy(camera.quaternion);
+  if (next === orthoCam) {
+    orthoCam.userData.halfH = dist * Math.tan(THREE.MathUtils.degToRad(perspCam.fov / 2));
+    orthoCam.zoom = 1;
+  } else {
+    // map ortho zoom back to a perspective distance
+    const d = orthoCam.userData.halfH / orthoCam.zoom / Math.tan(THREE.MathUtils.degToRad(perspCam.fov / 2));
+    next.position.sub(controls.target).setLength(d).add(controls.target);
+  }
+  next.add(sun);
+  camera = next; controls.object = next;
+  resize(); controls.update();
+}
+
+const boxLines = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(2, 2, 2)),
+  new THREE.LineBasicMaterial({ color: 0x5b6575 }));
+scene.add(boxLines);
+const axes = new THREE.AxesHelper(0.35); axes.position.set(-1, -1, -1); scene.add(axes);
+
+const groups = { decor: new THREE.Group(), arrows: new THREE.Group(), lines: new THREE.Group(), particles: new THREE.Group(), slice: new THREE.Group() };
+Object.values(groups).forEach(g => scene.add(g));
+
+function clearGroup(g) {
+  g.traverse(o => { o.geometry?.dispose(); if (o.material) [].concat(o.material).forEach(m => { m.map?.dispose(); m.dispose(); }); });
+  g.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Parameters + state
+// ---------------------------------------------------------------------------
+const params = {
+  source: 'browser (JS)', exportFormat: 'VTK legacy (.vtk)', generator: 'Tornado', resolution: 24, seed: 1, preset: 'Streamlines (animated)',
+  colormap: 'turbo', reversePalette: false, projection: 'perspective', showBox: true, autoRotate: false, background: '#0e1116',
+  arrows:    { show: false, stride: 2, scale: 1.0, thickness: 0.45, uniform: false, minSpeed: 0.03, region: 'volume', opacity: 1 },
+  lines:     { show: true, seeding: 'auto', count: 160, step: 0.01, maxSteps: 700, both: true, tubes: false,
+               radius: 0.006, animate: true, pulseSpeed: 0.5, pulseDensity: 2.0, opacity: 0.95 },
+  particles: { show: false, count: 3000, speed: 0.35, trail: 10, size: 3, spawn: 'auto' },
+  slice:     { show: false, axis: 'z', pos: 0, quantity: 'speed', palette: 'auto', opacity: 0.85 },
+};
+let field = null, gen = null, genName = '';
+const stats = { lines: 0, verts: 0, arrows: 0 };
+
+let serverGens = null;   // filled if the REST backend (server.py) is reachable
+const API_BASE = (() => { const a = new URLSearchParams(location.search).get('api'); return a ? a.replace(/\/?$/, '/') : ''; })();
+async function regenerate() {
+  const n = params.resolution;
+  const remote = params.source === 'server API' && serverGens?.find(g => g.name === params.generator);
+  if (remote) {
+    const r = await fetch(`${API_BASE}api/fields/${remote.id}?n=${n}&seed=${params.seed}`);
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    field = new Field(...j.dims, Float32Array.from(j.data));
+    // reuse local decorations (sphere, charges) / spawners by name
+    gen = { ...(GENERATORS[j.name] || {}), desc: j.desc + ' [served by REST API]', seeding: j.seeding };
+    genName = j.name;
+  } else {
+    gen = GENERATORS[params.generator]; genName = params.generator;
+    field = new Field(n, n, n);
+    field.fill(gen.make(params.seed));
+  }
+  field.computeDerived();
+  rebuildAll();
+}
+
+function rebuildAll() {
+  clearGroup(groups.decor); gen.decorate?.(groups.decor);
+  rebuildArrows(); rebuildLines(); resetParticles(); rebuildSlice(); updateLegend(); updateInfo();
+}
+
+// ---------------------------------------------------------------------------
+// Seeding: one random point per call, by mode
+// ---------------------------------------------------------------------------
+const SEED_MODES = ['auto', 'random', 'inlet (−X face)', 'slice plane', 'sphere r=0.5', 'diagonal rake', 'ground ring'];
+function spawnPoint(mode, rng) {
+  if (mode === 'auto') { if (gen.spawn) return gen.spawn(rng); mode = ({ inlet: 'inlet (−X face)', ring: 'ground ring' })[gen.seeding] || 'random'; }
+  const u = () => rng() * 1.9 - 0.95;
+  switch (mode) {
+    case 'inlet (−X face)': return [-0.98, u(), u()];
+    case 'slice plane': {
+      const p = [u(), u(), u()], ax = { x: 0, y: 1, z: 2 }[params.slice.axis];
+      p[ax] = params.slice.pos; return p; }
+    case 'sphere r=0.5': { const d = randDir(rng); return d.map(c => c * 0.5); }
+    case 'diagonal rake': { const t = rng() * 1.8 - 0.9; return [t, t * 0.6, t * 0.3]; }
+    case 'ground ring': { const a = rng() * Math.PI * 2, r = 0.45 + rng() * 0.45; return [r * Math.cos(a), r * Math.sin(a), -0.9 + rng() * 0.2]; }
+    default: return [u(), u(), u()];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Arrow glyphs (instanced)
+// ---------------------------------------------------------------------------
+const arrowGeom = (() => {
+  const shaft = new THREE.CylinderGeometry(0.07, 0.07, 0.62, 8, 1, true); shaft.translate(0, 0.31, 0);
+  const head = new THREE.ConeGeometry(0.2, 0.38, 12); head.translate(0, 0.81, 0);
+  return mergeGeometries([shaft, head]);
+})();
+
+function rebuildArrows() {
+  clearGroup(groups.arrows); stats.arrows = 0;
+  const A = params.arrows; if (!A.show) return;
+  const { nx, ny, nz } = field, s = A.stride, cell = 2 / (Math.max(nx, ny, nz) - 1) * s;
+  const pts = [];
+  const axIdx = { x: 0, y: 1, z: 2 }[params.slice.axis], dims = [nx, ny, nz];
+  const sliceIdx = Math.round((params.slice.pos + 1) / 2 * (dims[axIdx] - 1));
+  for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    const ijk = [i, j, k];
+    if (A.region === 'slice layer') { if (ijk[axIdx] !== sliceIdx) continue;
+      if (ijk.some((c, d) => d !== axIdx && c % s)) continue; }
+    else if (i % s || j % s || k % s) continue;
+    const p = (k * ny + j) * nx + i;
+    if (field.speed[p] < A.minSpeed * field.ref || field.speed[p] === 0) continue;
+    pts.push(p, i, j, k);
+  }
+  const count = pts.length / 4; if (!count) return;
+  const mat = new THREE.MeshStandardMaterial({ roughness: 0.55, metalness: 0.05, transparent: A.opacity < 1, opacity: A.opacity });
+  const mesh = new THREE.InstancedMesh(arrowGeom, mat, count);
+  const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), up = new THREE.Vector3(0, 1, 0), dir = new THREE.Vector3(),
+        pos = new THREE.Vector3(), scl = new THREE.Vector3(), col = new THREE.Color(), rgb = [0, 0, 0];
+  for (let n = 0; n < count; n++) {
+    const [p, i, j, k] = pts.slice(n * 4, n * 4 + 4), sp = field.speed[p];
+    dir.set(field.v[p*3], field.v[p*3+1], field.v[p*3+2]).divideScalar(sp);
+    q.setFromUnitVectors(up, dir);
+    const rel = Math.min(sp / field.ref, 1.4);
+    const L = A.scale * cell * (A.uniform ? 0.85 : 0.15 + 0.85 * rel);
+    const w = A.scale * A.thickness * cell * (A.uniform ? 0.85 : 0.35 + 0.65 * Math.sqrt(rel));
+    pos.set(field.coord(i, nx), field.coord(j, ny), field.coord(k, nz)).addScaledVector(dir, -L / 2);
+    m4.compose(pos, q, scl.set(w, L, w));
+    mesh.setMatrixAt(n, m4);
+    cmap(params.colormap, sp / field.ref, rgb);
+    mesh.setColorAt(n, col.setRGB(rgb[0], rgb[1], rgb[2], THREE.SRGBColorSpace));
+  }
+  groups.arrows.add(mesh); stats.arrows = count;
+}
+
+// ---------------------------------------------------------------------------
+// Streamlines (RK4 on the normalised field, arc-length steps)
+// ---------------------------------------------------------------------------
+const lineVS = `
+  attribute vec3 aColor; attribute float aTof;
+  varying vec3 vColor; varying float vTof; varying vec3 vN;
+  void main(){
+    vColor = aColor; vTof = aTof;
+    #ifdef LIT
+      vN = normalize(normalMatrix * normal);
+    #endif
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }`;
+const lineFS = `
+  uniform float uTime, uAnimate, uDensity, uOpacity;
+  varying vec3 vColor; varying float vTof; varying vec3 vN;
+  void main(){
+    vec3 c = vColor;
+    #ifdef LIT
+      vec3 n = normalize(vN);
+      c *= 0.35 + 0.75 * max(dot(n, normalize(vec3(0.4, 0.6, 1.0))), 0.0);
+      c += 0.25 * pow(max(dot(n, normalize(vec3(0.2, 0.3, 1.0))), 0.0), 24.0);
+    #endif
+    float a = uOpacity;
+    if (uAnimate > 0.5) {
+      float p = fract((vTof - uTime) * uDensity);
+      float k = pow(p, 5.0);
+      a *= 0.12 + 0.88 * k;
+      c *= 0.6 + 0.6 * k;
+    }
+    gl_FragColor = vec4(c, a);
+  }`;
+const lineUniforms = { uTime: { value: 0 }, uAnimate: { value: 1 }, uDensity: { value: 2 }, uOpacity: { value: 1 } };
+
+function integrate(p0, dir, h, maxSteps, eps) {
+  const out = [], v = [0, 0, 0], k1 = [0,0,0], k2 = [0,0,0], k3 = [0,0,0], k4 = [0,0,0];
+  const unit = (x, y, z, o) => { if (!field.sample(x, y, z, o)) return false;
+    const m = Math.hypot(o[0], o[1], o[2]); if (m < eps) return false; o[0] /= m; o[1] /= m; o[2] /= m; return true; };
+  if (!field.sample(p0[0], p0[1], p0[2], v)) return out;
+  let [x, y, z] = p0; out.push([x, y, z, Math.hypot(...v)]);
+  const H = h * dir;
+  for (let s = 0; s < maxSteps; s++) {
+    if (!unit(x, y, z, k1)) break;
+    if (!unit(x + 0.5*H*k1[0], y + 0.5*H*k1[1], z + 0.5*H*k1[2], k2)) break;
+    if (!unit(x + 0.5*H*k2[0], y + 0.5*H*k2[1], z + 0.5*H*k2[2], k3)) break;
+    if (!unit(x + H*k3[0], y + H*k3[1], z + H*k3[2], k4)) break;
+    x += H / 6 * (k1[0] + 2*k2[0] + 2*k3[0] + k4[0]);
+    y += H / 6 * (k1[1] + 2*k2[1] + 2*k3[1] + k4[1]);
+    z += H / 6 * (k1[2] + 2*k2[2] + 2*k3[2] + k4[2]);
+    if (!field.sample(x, y, z, v)) break;
+    out.push([x, y, z, Math.hypot(...v)]);
+  }
+  return out;
+}
+
+function traceAll() {
+  const L = params.lines, rng = mulberry32(params.seed * 31 + 7), eps = 1e-3 * field.ref, res = [];
+  for (let n = 0; n < L.count; n++) {
+    const seed = spawnPoint(L.seeding, rng);
+    let pts = integrate(seed, 1, L.step, L.maxSteps, eps);
+    if (L.both) { const b = integrate(seed, -1, L.step, L.maxSteps, eps); b.reverse(); b.pop(); pts = b.concat(pts); }
+    if (pts.length < 3) continue;
+    // time of flight (normalised by reference speed) drives the pulse animation
+    const tof = [0];
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i-1], b = pts[i], ds = Math.hypot(b[0]-a[0], b[1]-a[1], b[2]-a[2]);
+      tof.push(tof[i-1] + ds / Math.max((a[3] + b[3]) / 2 / field.ref, 0.05));
+    }
+    const off = rng() * 10; res.push({ pts, tof: tof.map(t => t + off) });
+  }
+  return res;
+}
+
+function rebuildLines() {
+  clearGroup(groups.lines); stats.lines = stats.verts = 0;
+  const L = params.lines; if (!L.show) return;
+  const lines = traceAll(), rgb = [0, 0, 0];
+  const mat = new THREE.ShaderMaterial({ vertexShader: lineVS, fragmentShader: lineFS, uniforms: lineUniforms,
+    transparent: true, depthWrite: !L.animate, defines: L.tubes ? { LIT: 1 } : {} });
+  let geom;
+  if (!L.tubes) {
+    let nv = 0; for (const l of lines) nv += l.pts.length;
+    const pos = new Float32Array(nv * 3), col = new Float32Array(nv * 3), tof = new Float32Array(nv), idx = [];
+    let o = 0;
+    for (const l of lines) {
+      l.pts.forEach((p, i) => {
+        pos.set(p.slice(0, 3), (o + i) * 3); cmap(params.colormap, p[3] / field.ref, col, (o + i) * 3); tof[o + i] = l.tof[i];
+        if (i) idx.push(o + i - 1, o + i);
+      });
+      o += l.pts.length;
+    }
+    geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geom.setAttribute('aColor', new THREE.BufferAttribute(col, 3));
+    geom.setAttribute('aTof', new THREE.BufferAttribute(tof, 1));
+    geom.setIndex(idx);
+    groups.lines.add(new THREE.LineSegments(geom, mat)); stats.verts = nv;
+  } else {
+    geom = buildTubes(lines, L.radius, 8);
+    groups.lines.add(new THREE.Mesh(geom, mat)); stats.verts = geom.attributes.position.count;
+  }
+  stats.lines = lines.length;
+}
+
+// Tubes with parallel-transport frames, one merged geometry
+function buildTubes(lines, radius, R) {
+  const pos = [], nor = [], col = [], tof = [], idx = [], rgb = [0, 0, 0];
+  const T = new THREE.Vector3(), N = new THREE.Vector3(), B = new THREE.Vector3(), tmp = new THREE.Vector3();
+  let base = 0;
+  for (const l of lines) {
+    const step = l.pts.length > 400 ? 2 : 1;
+    const P = [], tf = [];
+    for (let i = 0; i < l.pts.length; i += step) { P.push(l.pts[i]); tf.push(l.tof[i]); }
+    if (P.length < 2) continue;
+    N.set(0, 0, 0);
+    for (let i = 0; i < P.length; i++) {
+      const a = P[Math.max(i - 1, 0)], b = P[Math.min(i + 1, P.length - 1)];
+      T.set(b[0] - a[0], b[1] - a[1], b[2] - a[2]).normalize();
+      if (i === 0) { tmp.set(Math.abs(T.x) < 0.9 ? 1 : 0, Math.abs(T.x) < 0.9 ? 0 : 1, 0); N.crossVectors(T, tmp).normalize(); }
+      else { N.addScaledVector(T, -N.dot(T)).normalize(); }
+      B.crossVectors(T, N);
+      cmap(params.colormap, P[i][3] / field.ref, rgb);
+      for (let j = 0; j < R; j++) {
+        const th = j / R * Math.PI * 2, c = Math.cos(th), s = Math.sin(th);
+        const nx = c * N.x + s * B.x, ny = c * N.y + s * B.y, nz = c * N.z + s * B.z;
+        pos.push(P[i][0] + radius * nx, P[i][1] + radius * ny, P[i][2] + radius * nz);
+        nor.push(nx, ny, nz); col.push(...rgb); tof.push(tf[i]);
+        if (i < P.length - 1) {
+          const a0 = base + i * R + j, a1 = base + i * R + (j + 1) % R, b0 = a0 + R, b1 = a1 + R;
+          idx.push(a0, b0, a1, a1, b0, b1);
+        }
+      }
+    }
+    base += P.length * R;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+  g.setAttribute('aColor', new THREE.Float32BufferAttribute(col, 3));
+  g.setAttribute('aTof', new THREE.Float32BufferAttribute(tof, 1));
+  g.setIndex(idx);
+  return g;
+}
+
+// ---------------------------------------------------------------------------
+// Particles with fading trails
+// ---------------------------------------------------------------------------
+const trailVS = `attribute vec3 aColor; attribute float aAlpha; varying vec3 vColor; varying float vA;
+  void main(){ vColor = aColor; vA = aAlpha; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`;
+const trailFS = `varying vec3 vColor; varying float vA; void main(){ gl_FragColor = vec4(vColor, vA); }`;
+const headVS = `attribute vec3 aColor; attribute float aAlpha; uniform float uSize; varying vec3 vColor; varying float vA;
+  void main(){ vColor = aColor; vA = aAlpha; vec4 mv = modelViewMatrix * vec4(position,1.0);
+    gl_PointSize = uSize * 3.0 / max(-mv.z, 0.5); gl_Position = projectionMatrix * mv; }`;
+const headFS = `varying vec3 vColor; varying float vA;
+  void main(){ vec2 d = gl_PointCoord - 0.5; float r = dot(d,d); if (r > 0.25) discard;
+    gl_FragColor = vec4(vColor, vA * smoothstep(0.25, 0.1, r)); }`;
+const headUniforms = { uSize: { value: 3 } };
+
+let P = null;
+function resetParticles() {
+  clearGroup(groups.particles); P = null;
+  const C = params.particles; if (!C.show) return;
+  const N = C.count, T = Math.max(2, C.trail), rng = mulberry32(params.seed * 101 + 3);
+  P = { N, T, rng, hist: new Float32Array(N * T * 3), age: new Float32Array(N), life: new Float32Array(N), spd: new Float32Array(N) };
+  for (let i = 0; i < N; i++) { respawn(i); P.age[i] = rng() * P.life[i]; }
+  const nseg = N * (T - 1);
+  const tg = new THREE.BufferGeometry();
+  tg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(nseg * 6), 3).setUsage(THREE.DynamicDrawUsage));
+  tg.setAttribute('aColor', new THREE.BufferAttribute(new Float32Array(nseg * 6), 3).setUsage(THREE.DynamicDrawUsage));
+  tg.setAttribute('aAlpha', new THREE.BufferAttribute(new Float32Array(nseg * 2), 1).setUsage(THREE.DynamicDrawUsage));
+  const hg = new THREE.BufferGeometry();
+  hg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(N * 3), 3).setUsage(THREE.DynamicDrawUsage));
+  hg.setAttribute('aColor', new THREE.BufferAttribute(new Float32Array(N * 3), 3).setUsage(THREE.DynamicDrawUsage));
+  hg.setAttribute('aAlpha', new THREE.BufferAttribute(new Float32Array(N), 1).setUsage(THREE.DynamicDrawUsage));
+  const blend = { transparent: true, depthWrite: false };
+  P.trails = new THREE.LineSegments(tg, new THREE.ShaderMaterial({ vertexShader: trailVS, fragmentShader: trailFS, ...blend }));
+  P.heads = new THREE.Points(hg, new THREE.ShaderMaterial({ vertexShader: headVS, fragmentShader: headFS, uniforms: headUniforms, ...blend }));
+  P.trails.frustumCulled = P.heads.frustumCulled = false;
+  groups.particles.add(P.trails, P.heads);
+}
+function respawn(i) {
+  const p = spawnPoint(params.particles.spawn, P.rng);
+  for (let t = 0; t < P.T; t++) P.hist.set(p, (i * P.T + t) * 3);
+  P.age[i] = 0; P.life[i] = 2 + P.rng() * 5;
+}
+const _v = [0, 0, 0], _rgb = [0, 0, 0];
+function updateParticles(dt) {
+  if (!P) return;
+  const { N, T, hist } = P, k = params.particles.speed / field.ref * dt, eps = 1e-3 * field.ref;
+  const tp = P.trails.geometry.attributes, hp = P.heads.geometry.attributes;
+  for (let i = 0; i < N; i++) {
+    const b = i * T * 3;
+    let x = hist[b], y = hist[b+1], z = hist[b+2];
+    P.age[i] += dt;
+    let ok = field.sample(x, y, z, _v) && Math.hypot(..._v) > eps && P.age[i] < P.life[i];
+    if (ok) { // midpoint (RK2) step
+      const mx = x + 0.5 * k * _v[0], my = y + 0.5 * k * _v[1], mz = z + 0.5 * k * _v[2];
+      ok = field.sample(mx, my, mz, _v);
+      if (ok) { x += k * _v[0]; y += k * _v[1]; z += k * _v[2]; ok = field.sample(x, y, z, _v); }
+    }
+    if (!ok) { respawn(i); x = hist[b]; y = hist[b+1]; z = hist[b+2]; field.sample(x, y, z, _v); }
+    hist.copyWithin(b + 3, b, b + (T - 1) * 3);
+    hist[b] = x; hist[b+1] = y; hist[b+2] = z;
+    const sp = Math.hypot(..._v); cmap(params.colormap, sp / field.ref, _rgb);
+    const fade = Math.min(1, P.age[i] / 0.4, (P.life[i] - P.age[i]) / 0.6);
+    hp.position.array.set([x, y, z], i * 3); hp.aColor.array.set(_rgb, i * 3); hp.aAlpha.array[i] = Math.max(fade, 0);
+    for (let t = 0; t < T - 1; t++) {
+      const s = (i * (T - 1) + t) * 2;
+      tp.position.array.set(hist.subarray(b + t * 3, b + t * 3 + 6), s * 3);
+      tp.aColor.array.set(_rgb, s * 3); tp.aColor.array.set(_rgb, s * 3 + 3);
+      tp.aAlpha.array[s] = fade * (1 - t / (T - 1)) * 0.9;
+      tp.aAlpha.array[s + 1] = fade * (1 - (t + 1) / (T - 1)) * 0.9;
+    }
+  }
+  for (const a of [tp.position, tp.aColor, tp.aAlpha, hp.position, hp.aColor, hp.aAlpha]) a.needsUpdate = true;
+}
+
+// ---------------------------------------------------------------------------
+// Slice plane (scalar quantity as a texture)
+// ---------------------------------------------------------------------------
+const QUANTITIES = ['speed', 'vorticity |ω|', 'divergence', 'vx', 'vy', 'vz'];
+function quantityInfo(q) {
+  const pal = auto => params.slice.palette === 'auto' ? auto : params.slice.palette;
+  if (q === 'speed') return { cm: pal(params.colormap), lo: 0, hi: field.ref, label: 'Slice: speed |v|' };
+  if (q === 'vorticity |ω|') return { cm: pal('inferno'), lo: 0, hi: field.vortRef, label: 'Slice: vorticity |∇×v|' };
+  if (q === 'divergence') return { cm: pal('coolwarm'), lo: -field.divRef, hi: field.divRef, label: 'Slice: divergence ∇·v' };
+  return { cm: pal('coolwarm'), lo: -field.ref, hi: field.ref, label: 'Slice: ' + q };
+}
+function rebuildSlice() {
+  clearGroup(groups.slice);
+  const S = params.slice; if (!S.show) return;
+  const R = 160, data = new Uint8Array(R * R * 4), info = quantityInfo(S.quantity), rgb = [0, 0, 0], v = [0, 0, 0];
+  const ax = { x: 0, y: 1, z: 2 }[S.axis], [ua, va] = [[1, 2], [0, 2], [0, 1]][ax];
+  const world = (u, w) => { const p = [0, 0, 0]; p[ax] = S.pos; p[ua] = u; p[va] = w; return p; };
+  const comp = { vx: 0, vy: 1, vz: 2 }[S.quantity];
+  for (let j = 0; j < R; j++) for (let i = 0; i < R; i++) {
+    const [x, y, z] = world(-1 + 2 * i / (R - 1), -1 + 2 * j / (R - 1));
+    let val;
+    if (S.quantity === 'speed') val = field.sampleScalar(field.speed, x, y, z);
+    else if (S.quantity === 'divergence') val = field.sampleScalar(field.div, x, y, z);
+    else if (S.quantity.startsWith('vort')) val = field.sampleScalar(field.vort, x, y, z);
+    else { field.sample(x, y, z, v); val = v[comp]; }
+    cmap(info.cm, (val - info.lo) / (info.hi - info.lo), rgb);
+    const o = (j * R + i) * 4;
+    data[o] = rgb[0] * 255; data[o+1] = rgb[1] * 255; data[o+2] = rgb[2] * 255; data[o+3] = 255;
+  }
+  const tex = new THREE.DataTexture(data, R, R); tex.colorSpace = THREE.SRGBColorSpace;
+  tex.magFilter = tex.minFilter = THREE.LinearFilter; tex.needsUpdate = true;
+  const corners = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([u, w]) => world(u, w));
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(corners.flat(), 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute([0, 0, 1, 0, 1, 1, 0, 1], 2));
+  g.setIndex([0, 1, 2, 0, 2, 3]);
+  const mesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide,
+    transparent: S.opacity < 1, opacity: S.opacity, depthWrite: S.opacity >= 1 }));
+  const frame = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(corners.map(c => new THREE.Vector3(...c))),
+    new THREE.LineBasicMaterial({ color: 0xcfd6e0 }));
+  groups.slice.add(mesh, frame);
+}
+
+// ---------------------------------------------------------------------------
+// Legend + info panel
+// ---------------------------------------------------------------------------
+function legendRow(cm, lo, hi, label) {
+  const div = document.createElement('div'); div.className = 'lg';
+  const c = document.createElement('canvas'); c.width = 220; c.height = 1;
+  const ctx = c.getContext('2d'), img = ctx.createImageData(220, 1), rgb = [0, 0, 0];
+  for (let i = 0; i < 220; i++) { cmap(cm, i / 219, rgb); img.data.set([rgb[0]*255, rgb[1]*255, rgb[2]*255, 255], i * 4); }
+  ctx.putImageData(img, 0, 0);
+  const f = x => Math.abs(x) >= 100 || (Math.abs(x) < 0.01 && x !== 0) ? x.toExponential(1) : x.toFixed(2);
+  div.innerHTML = `<div class="title">${label}</div>`;
+  div.appendChild(c);
+  div.insertAdjacentHTML('beforeend', `<div class="ticks"><span>${f(lo)}</span><span>${f((lo + hi) / 2)}</span><span>${f(hi)}${hi === field.ref ? '+' : ''}</span></div>`);
+  return div;
+}
+function updateLegend() {
+  const el = document.getElementById('legend'); el.innerHTML = '';
+  if (params.arrows.show || params.lines.show || params.particles.show || (params.slice.show && params.slice.quantity === 'speed'))
+    el.appendChild(legendRow(params.colormap, 0, field.ref, 'Speed |v|'));
+  if (params.slice.show && (params.slice.quantity !== 'speed' || params.slice.palette !== 'auto')) { const q = quantityInfo(params.slice.quantity); el.appendChild(legendRow(q.cm, q.lo, q.hi, q.label)); }
+  el.style.display = el.children.length ? '' : 'none';
+}
+function updateInfo() {
+  document.getElementById('genName').textContent = genName;
+  document.getElementById('genDesc').textContent = gen.desc;
+  document.getElementById('stats').innerHTML =
+    `source: ${genName === 'Custom field' ? 'file' : params.source === 'server API' && serverGens ? 'REST API' : 'browser'} · ` +
+    `grid ${field.nx}×${field.ny}×${field.nz} · max |v| ${field.maxSpeed.toFixed(2)} · p98 ${field.ref.toFixed(2)}<br>` +
+    (params.arrows.show ? `arrows ${stats.arrows} · ` : '') +
+    (params.lines.show ? `streamlines ${stats.lines} (${stats.verts} verts) · ` : '') +
+    (params.particles.show ? `particles ${params.particles.count}` : '');
+}
+
+// ---------------------------------------------------------------------------
+// Presets
+// ---------------------------------------------------------------------------
+const PRESETS = {
+  'Arrows overview':        { arrows: { show: true, region: 'volume', stride: 2, opacity: 1 }, lines: { show: false }, particles: { show: false }, slice: { show: false } },
+  'Streamlines (animated)': { arrows: { show: false }, lines: { show: true, tubes: false, animate: true, count: 160 }, particles: { show: false }, slice: { show: false } },
+  'Streamtubes':            { arrows: { show: false }, lines: { show: true, tubes: true, animate: false, count: 70, radius: 0.008 }, particles: { show: false }, slice: { show: false } },
+  'Particle smoke':         { arrows: { show: false }, lines: { show: false }, particles: { show: true, trail: 14, count: 3000 }, slice: { show: false } },
+  'Slice + vectors':        { arrows: { show: true, region: 'slice layer', stride: 1, opacity: 1 }, lines: { show: false }, particles: { show: false }, slice: { show: true, quantity: 'speed', opacity: 0.8 } },
+  'Vorticity + streamlines':{ arrows: { show: false }, lines: { show: true, tubes: false, animate: true, seeding: 'slice plane', count: 120 }, particles: { show: false }, slice: { show: true, quantity: 'vorticity |ω|', opacity: 0.75 } },
+  'Everything':             { arrows: { show: true, region: 'volume', stride: 3, opacity: 0.5 }, lines: { show: true, tubes: false, animate: true, count: 80 }, particles: { show: true, trail: 8, count: 1500 }, slice: { show: true, quantity: 'speed', opacity: 0.6 } },
+};
+function applyPreset(name) {
+  for (const [sec, vals] of Object.entries(PRESETS[name])) Object.assign(params[sec], vals);
+  gui.controllersRecursive().forEach(c => c.updateDisplay());
+  syncUniforms(); rebuildAll();
+}
+
+// ---------------------------------------------------------------------------
+// GUI
+// ---------------------------------------------------------------------------
+const busy = document.getElementById('busy');
+const withBusy = fn => () => {
+  busy.style.display = 'block';
+  setTimeout(() => Promise.resolve().then(fn).catch(e => alert(e.message)).finally(() => busy.style.display = 'none'), 10);
+};
+const syncUniforms = () => {
+  lineUniforms.uAnimate.value = params.lines.animate ? 1 : 0;
+  lineUniforms.uDensity.value = params.lines.pulseDensity;
+  lineUniforms.uOpacity.value = params.lines.opacity;
+  headUniforms.uSize.value = params.particles.size;
+};
+
+// Lighter defaults on phones/tablets
+if (isMobile) { params.resolution = 20; params.lines.count = 100; params.particles.count = 1500; }
+const gui = new GUI({ title: 'Vector field', width: Math.min(280, innerWidth - 24) });
+const fData = gui.addFolder('Data');
+fData.add(params, 'generator', Object.keys(GENERATORS)).onChange(withBusy(regenerate));
+fData.add(params, 'resolution', 8, 48, 1).name('grid size').onFinishChange(withBusy(regenerate));
+fData.add(params, 'seed', 1, 999, 1).name('random seed').onFinishChange(withBusy(regenerate));
+
+gui.add(params, 'preset', Object.keys(PRESETS)).name('Preset view').onChange(withBusy(() => applyPreset(params.preset)));
+
+gui.add(params, 'colormap', Object.keys(CMAP_STOPS)).name('Color palette').onChange(withBusy(rebuildAll));
+gui.add(params, 'reversePalette').name('Reverse palette').onChange(withBusy(rebuildAll));
+
+const fView = gui.addFolder('View');
+fView.add(params, 'showBox').name('bounding box').onChange(v => { boxLines.visible = axes.visible = v; });
+fView.add(params, 'autoRotate').name('auto-rotate').onChange(v => controls.autoRotate = v);
+fView.addColor(params, 'background').onChange(v => { scene.background = new THREE.Color(v); document.body.style.background = v; });
+fView.add(params, 'projection', ['perspective', 'orthographic']).onChange(setProjection);
+fView.add({ reset: () => {
+  camera.position.copy(homeView()); controls.target.set(0, 0, 0);
+  if (camera === orthoCam) { orthoCam.zoom = 1; orthoCam.updateProjectionMatrix(); }
+} }, 'reset').name('Reset camera');
+fView.close();
+
+const fA = gui.addFolder('Arrows');
+const A = params.arrows, rA = withBusy(() => { rebuildArrows(); updateLegend(); updateInfo(); });
+fA.add(A, 'show').onChange(rA);
+fA.add(A, 'region', ['volume', 'slice layer']).onChange(rA);
+fA.add(A, 'stride', 1, 6, 1).onFinishChange(rA);
+fA.add(A, 'scale', 0.2, 3, 0.05).onFinishChange(rA);
+fA.add(A, 'thickness', 0.1, 1.5, 0.05).onFinishChange(rA);
+fA.add(A, 'uniform').name('uniform length').onChange(rA);
+fA.add(A, 'minSpeed', 0, 0.8, 0.01).name('hide below (×ref)').onFinishChange(rA);
+fA.add(A, 'opacity', 0.1, 1, 0.05).onFinishChange(rA);
+fA.close();
+
+const fL = gui.addFolder('Streamlines');
+const L = params.lines, rL = withBusy(() => { rebuildLines(); updateLegend(); updateInfo(); });
+fL.add(L, 'show').onChange(rL);
+fL.add(L, 'seeding', SEED_MODES).onChange(rL);
+fL.add(L, 'count', 10, 800, 10).onFinishChange(rL);
+fL.add(L, 'step', 0.002, 0.04, 0.001).name('step (arc length)').onFinishChange(rL);
+fL.add(L, 'maxSteps', 50, 3000, 50).name('max steps / dir').onFinishChange(rL);
+fL.add(L, 'both').name('trace backward too').onChange(rL);
+fL.add(L, 'tubes').name('render as tubes').onChange(rL);
+fL.add(L, 'radius', 0.002, 0.03, 0.001).name('tube radius').onFinishChange(rL);
+fL.add(L, 'animate').name('animated pulses').onChange(() => { syncUniforms(); rL(); });
+fL.add(L, 'pulseSpeed', 0, 3, 0.05).name('pulse speed');
+fL.add(L, 'pulseDensity', 0.2, 8, 0.1).name('pulse density').onChange(syncUniforms);
+fL.add(L, 'opacity', 0.1, 1, 0.05).onChange(syncUniforms);
+
+const fP = gui.addFolder('Particles');
+const C = params.particles, rP = withBusy(() => { resetParticles(); updateLegend(); updateInfo(); });
+fP.add(C, 'show').onChange(rP);
+fP.add(C, 'spawn', SEED_MODES).onChange(rP);
+fP.add(C, 'count', 100, 20000, 100).onFinishChange(rP);
+fP.add(C, 'trail', 2, 40, 1).name('trail length').onFinishChange(rP);
+fP.add(C, 'speed', 0.02, 2, 0.01).name('speed (at ref)');
+fP.add(C, 'size', 0.5, 10, 0.5).name('head size').onChange(syncUniforms);
+fP.close();
+
+const fS = gui.addFolder('Slice plane');
+const S = params.slice;
+const rS = withBusy(() => {
+  rebuildSlice(); updateLegend();
+  if (A.show && A.region === 'slice layer') rebuildArrows();
+  if (L.show && L.seeding === 'slice plane') rebuildLines();
+  updateInfo();
+});
+fS.add(S, 'show').onChange(rS);
+fS.add(S, 'axis', ['x', 'y', 'z']).onChange(rS);
+fS.add(S, 'pos', -1, 1, 0.01).name('position').onChange(() => rebuildSlice()).onFinishChange(rS);
+fS.add(S, 'quantity', QUANTITIES).onChange(rS);
+fS.add(S, 'palette', ['auto', ...Object.keys(CMAP_STOPS)]).name('slice palette').onChange(rS);
+fS.add(S, 'opacity', 0.1, 1, 0.05).onFinishChange(rS);
+fS.close();
+
+// ---------------------------------------------------------------------------
+// File I/O. Internal layout: vectors x-fastest, then y, then z. The grid is always mapped onto
+// [-1,1]^3 for display (physical origin/spacing in files is ignored; exports use origin -1).
+//   .vtk  VTK legacy STRUCTURED_POINTS, ASCII or BINARY (ParaView, VisIt, VTK)
+//   .vti  VTK XML ImageData, ascii or inline binary (uncompressed)
+//   .npy  NumPy array, shape (nz,ny,nx,3) i.e. a[k,j,i,:]  (also accepts (3,nz,ny,nx))
+//   .csv  columns x,y,z,vx,vy,vz (also u,v,w or ParaView's Points:0 / velocity:0 names)
+//   .json { "dims":[nx,ny,nz], "data":[vx,vy,vz, ...] }
+// ---------------------------------------------------------------------------
+const td = new TextDecoder();
+const RD = {
+  f4: (d, o, l) => d.getFloat32(o, l), f8: (d, o, l) => d.getFloat64(o, l),
+  i1: (d, o) => d.getInt8(o), u1: (d, o) => d.getUint8(o),
+  i2: (d, o, l) => d.getInt16(o, l), u2: (d, o, l) => d.getUint16(o, l),
+  i4: (d, o, l) => d.getInt32(o, l), u4: (d, o, l) => d.getUint32(o, l),
+  i8: (d, o, l) => Number(d.getBigInt64(o, l)), u8: (d, o, l) => Number(d.getBigUint64(o, l)),
+};
+const SZ = { f4: 4, f8: 8, i1: 1, u1: 1, i2: 2, u2: 2, i4: 4, u4: 4, i8: 8, u8: 8 };
+const VTK_T = { float: 'f4', double: 'f8', char: 'i1', unsigned_char: 'u1', short: 'i2', unsigned_short: 'u2',
+  int: 'i4', unsigned_int: 'u4', long: 'i8', unsigned_long: 'u8', vtktypeint64: 'i8', vtktypeuint64: 'u8' };
+const VTI_T = { Float32: 'f4', Float64: 'f8', Int8: 'i1', UInt8: 'u1', Int16: 'i2', UInt16: 'u2',
+  Int32: 'i4', UInt32: 'u4', Int64: 'i8', UInt64: 'u8' };
+const typeCode = (map, t) => { const c = map[t] || map[t?.toLowerCase()]; if (!c) throw new Error(`unsupported data type "${t}"`); return c; };
+const spacing = f => [2 / (f.nx - 1), 2 / (f.ny - 1), 2 / (f.nz - 1)].map(h => +h.toPrecision(9));
+
+class ByteReader {
+  constructor(buf) { this.u8 = new Uint8Array(buf); this.dv = new DataView(buf); this.p = 0; }
+  eof() { return this.p >= this.u8.length; }
+  line() { const s = this.p; while (this.p < this.u8.length && this.u8[this.p] !== 10) this.p++;
+    const t = td.decode(this.u8.subarray(s, this.p)); this.p++; return t.trim(); }
+  next() { while (!this.eof()) { const l = this.line(); if (l) return l; } return null; }
+  values(n, code, binary) {
+    const out = new Float64Array(n);
+    if (binary) {   // VTK legacy binary is big-endian
+      const sz = SZ[code], rd = RD[code];
+      if (this.p + n * sz > this.u8.length) throw new Error('unexpected end of binary data');
+      for (let i = 0; i < n; i++) out[i] = rd(this.dv, this.p + i * sz, false);
+      this.p += n * sz;
+    } else {
+      let i = 0;
+      while (i < n) { if (this.eof()) throw new Error('unexpected end of ASCII data');
+        for (const t of this.line().split(/\s+/)) if (t && i < n) out[i++] = +t; }
+    }
+    return out;
+  }
+}
+function b64encode(u8) { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode(...u8.subarray(i, i + 0x8000)); return btoa(s); }
+const b64decode = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+
+const FORMATS = {
+  'VTK legacy (.vtk)': {
+    ext: 'vtk', mime: 'application/octet-stream',
+    read(buf) {
+      const r = new ByteReader(buf);
+      if (!r.line().startsWith('# vtk')) throw new Error('missing "# vtk DataFile" header');
+      r.line();   // title
+      const bin = (r.next() || '').toUpperCase() === 'BINARY';
+      let dims, n = 0, cell = false, vec = null;
+      for (let l; !vec && (l = r.next()) !== null;) {
+        const t = l.split(/\s+/), kw = t[0].toUpperCase();
+        if (kw === 'DATASET') { if (t[1].toUpperCase() !== 'STRUCTURED_POINTS') throw new Error(`only STRUCTURED_POINTS is supported (file has ${t[1]})`); }
+        else if (kw === 'DIMENSIONS') dims = t.slice(1, 4).map(Number);
+        else if (kw === 'POINT_DATA' || kw === 'CELL_DATA') { n = +t[1]; cell = kw === 'CELL_DATA'; }
+        else if (kw === 'VECTORS' || kw === 'NORMALS') { const v = r.values(n * 3, typeCode(VTK_T, t[2]), bin); if (kw === 'VECTORS' && !cell) vec = v; }
+        else if (kw === 'SCALARS') {
+          const nc = +(t[3] || 1), lt = r.next();
+          if (!/^LOOKUP_TABLE/i.test(lt)) throw new Error('SCALARS without LOOKUP_TABLE');
+          r.values(n * nc, typeCode(VTK_T, t[2]), bin);
+        }
+        else if (kw === 'LOOKUP_TABLE') r.values(+t[2] * 4, bin ? 'u1' : 'f4', bin);
+        else if (kw === 'FIELD') {
+          for (let a = 0; a < +t[2]; a++) {
+            const [, nc, nt, ty] = r.next().split(/\s+/), v = r.values(+nc * +nt, typeCode(VTK_T, ty), bin);
+            if (!cell && !vec && +nc === 3 && +nt === n) vec = v;
+          }
+        }
+        else if (['COLOR_SCALARS', 'TEXTURE_COORDINATES', 'TENSORS'].includes(kw)) throw new Error(`unsupported section ${kw} before the vectors`);
+        // ORIGIN / SPACING / ASPECT_RATIO / METADATA lines are ignored
+      }
+      if (!dims) throw new Error('no DIMENSIONS found');
+      if (!vec) throw new Error('no point VECTORS (or 3-component FIELD array) found');
+      return { dims, data: Float32Array.from(vec) };
+    },
+    write(f) {
+      const N = f.nx * f.ny * f.nz, dv = new DataView(new ArrayBuffer(N * 12));
+      for (let i = 0; i < N * 3; i++) dv.setFloat32(i * 4, f.v[i], false);
+      return [`# vtk DataFile Version 3.0\nvector field (field-viz)\nBINARY\nDATASET STRUCTURED_POINTS\n` +
+        `DIMENSIONS ${f.nx} ${f.ny} ${f.nz}\nORIGIN -1 -1 -1\nSPACING ${spacing(f).join(' ')}\n` +
+        `POINT_DATA ${N}\nVECTORS velocity float\n`, dv.buffer, '\n'];
+    },
+  },
+  'VTK XML ImageData (.vti)': {
+    ext: 'vti', mime: 'application/xml',
+    read(buf) {
+      const doc = new DOMParser().parseFromString(td.decode(buf), 'application/xml');
+      if (doc.querySelector('parsererror')) throw new Error('invalid XML');
+      const root = doc.querySelector('VTKFile');
+      if (root?.getAttribute('type') !== 'ImageData') throw new Error('not a VTK ImageData file');
+      if (root.getAttribute('compressor')) throw new Error('compressed .vti is not supported (save uncompressed)');
+      const e = doc.querySelector('ImageData').getAttribute('WholeExtent').trim().split(/\s+/).map(Number);
+      const dims = [e[1] - e[0] + 1, e[3] - e[2] + 1, e[5] - e[4] + 1], N = dims[0] * dims[1] * dims[2] * 3;
+      const pd = doc.querySelector('PointData'), arrays = [...(pd?.querySelectorAll('DataArray') || [])];
+      const vname = pd?.getAttribute('Vectors');
+      const da = arrays.find(a => vname && a.getAttribute('Name') === vname) || arrays.find(a => a.getAttribute('NumberOfComponents') === '3');
+      if (!da) throw new Error('no 3-component PointData array found');
+      const fmt = da.getAttribute('format');
+      if (fmt === 'ascii') return { dims, data: Float32Array.from(da.textContent.trim().split(/\s+/), Number) };
+      if (fmt !== 'binary') throw new Error('"appended" .vti data is not supported (use ascii or binary)');
+      const code = typeCode(VTI_T, da.getAttribute('type')), little = root.getAttribute('byte_order') !== 'BigEndian';
+      const hdr = root.getAttribute('header_type') === 'UInt64' ? 8 : 4, s = da.textContent.replace(/\s+/g, '');
+      const hl = Math.ceil(hdr / 3) * 4;   // some writers base64-encode header and data as separate blocks
+      const bytes = s.slice(0, hl).endsWith('=') ? b64decode(s.slice(hl)) : b64decode(s).subarray(hdr);
+      const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength), data = new Float32Array(N);
+      if (bytes.byteLength < N * SZ[code]) throw new Error('binary data shorter than expected');
+      for (let i = 0; i < N; i++) data[i] = RD[code](dv, i * SZ[code], little);
+      return { dims, data };
+    },
+    write(f) {
+      const raw = new Uint8Array(4 + f.v.byteLength), dv = new DataView(raw.buffer);
+      dv.setUint32(0, f.v.byteLength, true);
+      for (let i = 0; i < f.v.length; i++) dv.setFloat32(4 + i * 4, f.v[i], true);
+      const ext = `0 ${f.nx - 1} 0 ${f.ny - 1} 0 ${f.nz - 1}`;
+      return [`<?xml version="1.0"?>\n<VTKFile type="ImageData" version="0.1" byte_order="LittleEndian" header_type="UInt32">\n` +
+        `  <ImageData WholeExtent="${ext}" Origin="-1 -1 -1" Spacing="${spacing(f).join(' ')}">\n    <Piece Extent="${ext}">\n` +
+        `      <PointData Vectors="velocity">\n        <DataArray type="Float32" Name="velocity" NumberOfComponents="3" format="binary">\n` +
+        b64encode(raw) + `\n        </DataArray>\n      </PointData>\n    </Piece>\n  </ImageData>\n</VTKFile>\n`];
+    },
+  },
+  'NumPy (.npy)': {
+    ext: 'npy', mime: 'application/octet-stream',
+    read(buf) {
+      const u8 = new Uint8Array(buf), dv = new DataView(buf);
+      if (u8[0] !== 0x93 || td.decode(u8.subarray(1, 6)) !== 'NUMPY') throw new Error('not a .npy file');
+      const v1 = u8[6] === 1, hlen = v1 ? dv.getUint16(8, true) : dv.getUint32(8, true), off = v1 ? 10 : 12;
+      const hdr = td.decode(u8.subarray(off, off + hlen));
+      const descr = /'descr'\s*:\s*'([^']+)'/.exec(hdr)?.[1] || '';
+      const fortran = /'fortran_order'\s*:\s*True/.test(hdr);
+      const shape = (/'shape'\s*:\s*\(([^)]*)\)/.exec(hdr)?.[1] || '').split(',').map(s => s.trim()).filter(Boolean).map(Number);
+      const code = descr.slice(1), little = descr[0] !== '>';
+      if (!RD[code]) throw new Error(`unsupported dtype ${descr}`);
+      if (shape.length !== 4) throw new Error(`expected a 4-D array (nz,ny,nx,3), got shape (${shape})`);
+      const st = [0, 0, 0, 0];   // element strides
+      if (fortran) { let s = 1; for (let d = 0; d < 4; d++) { st[d] = s; s *= shape[d]; } }
+      else { let s = 1; for (let d = 3; d >= 0; d--) { st[d] = s; s *= shape[d]; } }
+      const [az, ay, ax, ac] = shape[3] === 3 ? [0, 1, 2, 3] : shape[0] === 3 ? [1, 2, 3, 0] : (() => { throw new Error(`no axis of length 3 in shape (${shape})`); })();
+      const nz = shape[az], ny = shape[ay], nx = shape[ax], data = new Float32Array(nx * ny * nz * 3), sz = SZ[code], base = off + hlen;
+      let p = 0;
+      for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) for (let c = 0; c < 3; c++)
+        data[p++] = RD[code](dv, base + (k * st[az] + j * st[ay] + i * st[ax] + c * st[ac]) * sz, little);
+      return { dims: [nx, ny, nz], data };
+    },
+    write(f) {
+      let h = `{'descr': '<f4', 'fortran_order': False, 'shape': (${f.nz}, ${f.ny}, ${f.nx}, 3), }`;
+      h = h.padEnd(Math.ceil((10 + h.length + 1) / 64) * 64 - 10 - 1) + '\n';
+      const pre = new Uint8Array(10); pre.set([0x93, 78, 85, 77, 80, 89, 1, 0]); new DataView(pre.buffer).setUint16(8, h.length, true);
+      const body = new DataView(new ArrayBuffer(f.v.byteLength));
+      for (let i = 0; i < f.v.length; i++) body.setFloat32(i * 4, f.v[i], true);
+      return [pre, h, body.buffer];
+    },
+  },
+  'CSV (.csv)': {
+    ext: 'csv', mime: 'text/csv',
+    read(buf) {
+      const lines = td.decode(buf).split(/\r?\n/).filter(l => l.trim() && !l.startsWith('#'));
+      const sep = lines[0].includes(',') ? ',' : lines[0].includes(';') ? ';' : /\s+/;
+      const split = l => l.trim().split(sep).map(s => s.trim().replace(/^"|"$/g, ''));
+      let cols = [0, 1, 2, 3, 4, 5], start = 0;
+      const head = split(lines[0]).map(s => s.toLowerCase());
+      if (head.some(h => isNaN(parseFloat(h)))) {
+        start = 1;
+        const names = [['x', 'points:0', 'coords:0'], ['y', 'points:1', 'coords:1'], ['z', 'points:2', 'coords:2'],
+          ['vx', 'u', 'velocity:0', 'velocity_x', 'v:0'], ['vy', 'v', 'velocity:1', 'velocity_y', 'v:1'], ['vz', 'w', 'velocity:2', 'velocity_z', 'v:2']];
+        cols = names.map(n => head.findIndex(h => n.includes(h)));
+        if (cols.some(c => c < 0)) throw new Error('CSV header must contain x,y,z and vx,vy,vz (or u,v,w)');
+      }
+      const rows = lines.slice(start).map(l => { const t = split(l); return cols.map(c => +t[c]); });
+      const axis = d => { const u = [...new Set(rows.map(r => +r[d].toPrecision(7)))].sort((a, b) => a - b); return [u, new Map(u.map((v, i) => [v, i]))]; };
+      const [[ux, mx], [uy, my], [uz, mz]] = [axis(0), axis(1), axis(2)];
+      const nx = ux.length, ny = uy.length, nz = uz.length;
+      if (nx * ny * nz !== rows.length) throw new Error(`points do not form a full regular grid (${nx}×${ny}×${nz} ≠ ${rows.length} rows)`);
+      const data = new Float32Array(rows.length * 3);
+      for (const r of rows) {
+        const p = ((mz.get(+r[2].toPrecision(7)) * ny + my.get(+r[1].toPrecision(7))) * nx + mx.get(+r[0].toPrecision(7))) * 3;
+        data[p] = r[3]; data[p + 1] = r[4]; data[p + 2] = r[5];
+      }
+      return { dims: [nx, ny, nz], data };
+    },
+    write(f) {
+      const out = ['x,y,z,vx,vy,vz']; let p = 0;
+      for (let k = 0; k < f.nz; k++) for (let j = 0; j < f.ny; j++) for (let i = 0; i < f.nx; i++, p += 3)
+        out.push(`${f.coord(i, f.nx).toFixed(6)},${f.coord(j, f.ny).toFixed(6)},${f.coord(k, f.nz).toFixed(6)},` +
+          `${f.v[p].toPrecision(7)},${f.v[p + 1].toPrecision(7)},${f.v[p + 2].toPrecision(7)}`);
+      return [out.join('\n') + '\n'];
+    },
+  },
+  'JSON (.json)': {
+    ext: 'json', mime: 'application/json',
+    read(buf) { const j = JSON.parse(td.decode(buf)); return { dims: j.dims || [j.nx, j.ny, j.nz], data: Float32Array.from(j.data) }; },
+    write(f) { return [JSON.stringify({ dims: [f.nx, f.ny, f.nz], data: Array.from(f.v, x => +x.toFixed(5)) })]; },
+  },
+};
+const EXT_FORMAT = { vtk: 'VTK legacy (.vtk)', vti: 'VTK XML ImageData (.vti)', npy: 'NumPy (.npy)', csv: 'CSV (.csv)', txt: 'CSV (.csv)', json: 'JSON (.json)' };
+
+function exportField() {
+  const fmt = FORMATS[params.exportFormat];
+  const blob = new Blob(fmt.write(field), { type: fmt.mime });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  a.download = `${genName.replace(/\W+/g, '_')}_${field.nx}x${field.ny}x${field.nz}.${fmt.ext}`;
+  a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+async function importFile(file) {
+  busy.style.display = 'block';
+  try {
+    const name = EXT_FORMAT[file.name.split('.').pop().toLowerCase()];
+    if (!name) throw new Error('unknown extension (use .vtk, .vti, .npy, .csv or .json)');
+    const { dims: [nx, ny, nz], data } = FORMATS[name].read(await file.arrayBuffer());
+    if (!(nx >= 2 && ny >= 2 && nz >= 2)) throw new Error(`grid must be at least 2 points per axis (got ${nx}×${ny}×${nz})`);
+    if (data.length !== nx * ny * nz * 3) throw new Error(`expected ${nx * ny * nz * 3} values, got ${data.length}`);
+    field = new Field(nx, ny, nz, data); field.computeDerived();
+    gen = { desc: `Loaded from ${file.name} (${name}).`, seeding: 'random' }; genName = 'Custom field';
+    rebuildAll();
+  } catch (err) { alert(`Could not load ${file.name}: ${err.message}`); }
+  busy.style.display = 'none';
+}
+document.getElementById('fileInput').addEventListener('change', e => { if (e.target.files[0]) importFile(e.target.files[0]); e.target.value = ''; });
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer.files[0]) importFile(e.dataTransfer.files[0]); });
+fData.add({ load: () => document.getElementById('fileInput').click() }, 'load').name('Import file… (or drop)');
+fData.add(params, 'exportFormat', Object.keys(FORMATS)).name('export format');
+fData.add({ save: () => exportField() }, 'save').name('Export current field');
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false); canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+  perspCam.aspect = w / h; perspCam.updateProjectionMatrix();
+  const hh = orthoCam.userData.halfH || 1.6;
+  orthoCam.left = -hh * w / h; orthoCam.right = hh * w / h; orthoCam.top = hh; orthoCam.bottom = -hh;
+  orthoCam.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+scene.background = new THREE.Color(params.background);
+const infoEl = document.getElementById('info');
+document.getElementById('genName').addEventListener('click', () => infoEl.classList.toggle('collapsed'));
+if (innerWidth < 640) { gui.close(); infoEl.classList.add('collapsed'); }
+// Collapse the controls after a tap on the 3D view so it isn't covered on small screens
+canvas.addEventListener('pointerdown', () => { if (innerWidth < 640) gui.close(); });
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  lineUniforms.uTime.value += dt * params.lines.pulseSpeed;
+  updateParticles(dt);
+  controls.update();
+  renderer.render(scene, camera);
+});
+
+syncUniforms();
+// Works with or without the backend:
+//  - served by server.py            -> API found on same origin, used by default
+//  - static server / file://        -> API probe fails, fields are generated in the browser
+//  - static page + API elsewhere    -> index.html?api=http://localhost:8000/
+try {
+  const r = await fetch(API_BASE + 'api/fields', { signal: AbortSignal.timeout(3000) });
+  if (r.ok && (r.headers.get('content-type') || '').includes('application/json')) {
+    serverGens = await r.json();
+    params.source = 'server API';
+    fData.add(params, 'source', ['server API', 'browser (JS)']).name('data source').onChange(withBusy(regenerate));
+  }
+} catch { /* opened as a static file: browser-side generators only */ }
+withBusy(regenerate)();
+</script>
+</body>
+</html>
