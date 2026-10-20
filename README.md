@@ -1,7 +1,8 @@
 # field-viz
 
 A WebGL viewer for 3D vector fields on regular grids (air flow, velocity fields, force fields).
-It is a single HTML page using three.js, with an optional stdlib-only Python REST backend.
+It is a single HTML page using three.js. Two backends are optional: a stdlib-only Python REST
+server, and a Flask + ZeroMQ relay that streams time-varying data live.
 
 ![Tornado field with animated streamlines](docs/screenshot.png)
 
@@ -25,31 +26,95 @@ It is a single HTML page using three.js, with an optional stdlib-only Python RES
   Any palette can be reversed, and the slice plane can use its own palette.
 - **Views:** perspective or orthographic projection, auto-rotate, bounding box.
 - **Mobile:** works on phones and tablets (touch orbit/zoom, collapsible panels, lighter defaults).
+- **Live streaming:** time-varying fields from any Python process, through ZeroMQ, a Flask
+  WebSocket relay and binary frames to the browser.
 - **Import/export:** VTK legacy, VTK XML ImageData, NumPy, CSV, JSON (see below). You can also
   drag and drop a file onto the page.
 
-## Running
+## Running the examples
 
-**With the backend.** Requires Python 3.8+ and nothing else:
+| | What runs | Data source in the viewer | Needs |
+|---|---|---|---|
+| 1 | page only | in-browser generators | a browser |
+| 2 | `server.py` | REST API (+ in-browser) | Python 3.8+, no packages |
+| 3 | `stream_server.py` + `producer.py` | live WebSocket stream (+ REST, in-browser) | `pip install -r requirements.txt` |
+| 4 | `stream_server.py` + your own code | live stream of your data | same as 3 |
+
+The page detects which backend it is talking to and adds a **data source** switch.
+three.js and lil-gui load from the jsDelivr CDN, so the page needs internet access.
+
+### 1. Static, no backend
+
+Open `index.html` directly, or serve the folder with any static server
+(`python -m http.server`, nginx, GitHub Pages, ...). All fields are generated in the browser.
+
+### 2. REST server
 
 ```
-python server.py            # or: python server.py 8080
+python server.py              # http://localhost:8000/   (python server.py 8080 for another port)
 ```
 
-Open <http://localhost:8000/>. The page detects the API and adds a *data source* switch
-(server API or browser JS).
+To keep a static page but fetch data from a server on another host, add `?api=`:
+`index.html?api=http://localhost:8000/`. The backend sends CORS headers.
 
-**Without the backend.** Serve the folder with any static server, or open `index.html` directly.
-All fields are then generated in the browser.
+### 3. Live streaming demo
+
+![Live stream from the demo producer](docs/screenshot-live.png)
 
 ```
-python -m http.server       # or: npx serve, nginx, GitHub Pages, ...
+pip install -r requirements.txt     # flask, flask-sock, pyzmq, numpy
+
+# terminal 1: a time-varying field published over ZeroMQ
+python producer.py                                   # wandering tornado, 32^3, 10 fps
+python producer.py --scenario turbulence --n 40 --fps 5 --dtype int16
+python producer.py --scenario cycle                  # tornado -> turbulence -> charges every 20 s
+
+# terminal 2: relay to browsers (also serves the page and the REST API)
+python stream_server.py                              # http://localhost:8000/
+python stream_server.py --host 0.0.0.0               # allow phones etc. on your network
 ```
 
-**Static page with the API on another host:** `index.html?api=http://localhost:8000/`
-(the backend sends CORS headers).
+Start the two in either order. When a producer is running, the page selects **live stream**
+automatically; you can also add `?live` to the URL. The info panel shows the frame number,
+simulation time, fps and frame size. The **live max fps** slider limits how often the page asks
+for new frames. Particles keep moving through the field while it updates, and the colour range
+is smoothed over time so colours don't flicker.
 
-three.js and lil-gui are loaded from the jsDelivr CDN, so the page needs internet access.
+How it works:
+
+```
+producer(s) ──ZeroMQ PUB/SUB──▶ stream_server.py ──WebSocket, binary──▶ browsers
+            [meta JSON, frame]  keeps only the newest frame    "next" → newest frame
+```
+
+- **Binary frames:** a 40-byte header followed by raw float32 values, or int16 values with a
+  scale factor (`--dtype int16` halves the size). The browser uses the data almost as-is, with
+  no parsing.
+- **Pull-based, newest frame wins:** each client sends `next` when it is ready, and the relay
+  answers with the newest frame. A slow client skips frames instead of falling behind, so
+  nothing queues up and latency stays at one frame.
+- `GET /api/stream` reports the relay status: `{endpoint, frames, fps, bytes, age}`.
+
+The frame layout is documented in [fieldstream.py](fieldstream.py), which also provides
+`encode_frame` / `decode_frame`.
+
+### 4. Streaming your own data
+
+```python
+from fieldstream import FieldPublisher
+
+pub = FieldPublisher("tcp://*:5556", dtype="float32")    # or dtype="int16"
+while simulation_running:
+    v = step()                                  # numpy array, shape (nz, ny, nx, 3)
+    pub.send(v, name="My CFD run", desc="time step %d" % i, seeding="inlet")
+```
+
+Then run `python stream_server.py`; it subscribes to `tcp://localhost:5556` by default, or set
+`--zmq tcp://host:port`. For several producers, run the relay with `--bind` and create each
+publisher with `FieldPublisher("tcp://relay-host:5556", bind=False)`.
+
+Both servers use development web servers, which is fine on a local machine or LAN. For anything
+public, put the Flask app behind a production server.
 
 ## REST API
 

@@ -210,6 +210,34 @@ def build_field(gen_id, n, seed):
     return {"id": gen_id, "name": name, "desc": desc, "seeding": seeding, "dims": [n, n, n], "data": data}
 
 
+def list_generators():
+    return [{"id": k, "name": v[0], "desc": v[1], "seeding": v[2]} for k, v in GENERATORS.items()]
+
+
+def field_response(gen_id, query):
+    """Shared by server.py and stream_server.py.
+    query: dict of str -> str. Returns (status, content_type, body_bytes, extra_headers)."""
+    def err(status, msg):
+        return status, "application/json", json.dumps({"error": msg}).encode(), {}
+    if gen_id not in GENERATORS:
+        return err(404, "unknown generator")
+    try:
+        n = int(query.get("n", "24"))
+        seed = int(query.get("seed", "1"))
+    except ValueError:
+        return err(400, "n and seed must be integers")
+    if not 2 <= n <= MAX_N:
+        return err(400, f"n must be in [2, {MAX_N}]")
+    fmt = query.get("format", "json")
+    if fmt != "json" and fmt not in FORMATS:
+        return err(400, f"format must be one of json, {', '.join(FORMATS)}")
+    field = build_field(gen_id, n, seed)
+    if fmt == "json":
+        return 200, "application/json", json.dumps(field, separators=(",", ":")).encode(), {}
+    writer, ctype, ext = FORMATS[fmt]
+    return 200, ctype, writer(field), {"Content-Disposition": f'attachment; filename="{gen_id}_{n}x{n}x{n}.{ext}"'}
+
+
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
@@ -236,29 +264,15 @@ class Handler(SimpleHTTPRequestHandler):
         if parts[:2] != ["api", "fields"]:
             return super().do_GET()
         if len(parts) == 2:
-            return self.send_json([{"id": k, "name": v[0], "desc": v[1], "seeding": v[2]}
-                                   for k, v in GENERATORS.items()])
-        if len(parts) == 3 and parts[2] in GENERATORS:
-            q = parse_qs(url.query)
-            try:
-                n = int(q.get("n", ["24"])[0])
-                seed = int(q.get("seed", ["1"])[0])
-            except ValueError:
-                return self.send_json({"error": "n and seed must be integers"}, 400)
-            if not 2 <= n <= MAX_N:
-                return self.send_json({"error": f"n must be in [2, {MAX_N}]"}, 400)
-            fmt = q.get("format", ["json"])[0]
-            if fmt != "json" and fmt not in FORMATS:
-                return self.send_json({"error": f"format must be one of json, {', '.join(FORMATS)}"}, 400)
-            field = build_field(parts[2], n, seed)
-            if fmt == "json":
-                return self.send_json(field)
-            writer, ctype, ext = FORMATS[fmt]
-            body = writer(field)
-            self.send_response(200)
+            return self.send_json(list_generators())
+        if len(parts) == 3:
+            query = {k: v[0] for k, v in parse_qs(url.query).items()}
+            status, ctype, body, headers = field_response(parts[2], query)
+            self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Content-Disposition", f'attachment; filename="{parts[2]}_{n}x{n}x{n}.{ext}"')
+            for k, v in headers.items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
             return

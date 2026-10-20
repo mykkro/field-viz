@@ -347,7 +347,7 @@ function clearGroup(g) {
 // Parameters + state
 // ---------------------------------------------------------------------------
 const params = {
-  source: 'browser (JS)', exportFormat: 'VTK legacy (.vtk)', generator: 'Tornado', resolution: 24, seed: 1, preset: 'Streamlines (animated)',
+  source: 'browser (JS)', liveMaxFps: 10, exportFormat: 'VTK legacy (.vtk)', generator: 'Tornado', resolution: 24, seed: 1, preset: 'Streamlines (animated)',
   colormap: 'turbo', reversePalette: false, projection: 'perspective', showBox: true, autoRotate: false, background: '#0e1116',
   arrows:    { show: false, stride: 2, scale: 1.0, thickness: 0.45, uniform: false, minSpeed: 0.03, region: 'volume', opacity: 1 },
   lines:     { show: true, seeding: 'auto', count: 160, step: 0.01, maxSteps: 700, both: true, tubes: false,
@@ -361,6 +361,8 @@ const stats = { lines: 0, verts: 0, arrows: 0 };
 let serverGens = null;   // filled if the REST backend (server.py) is reachable
 const API_BASE = (() => { const a = new URLSearchParams(location.search).get('api'); return a ? a.replace(/\/?$/, '/') : ''; })();
 async function regenerate() {
+  if (params.source === 'live stream') return connectLive();
+  disconnectLive();
   const n = params.resolution;
   const remote = params.source === 'server API' && serverGens?.find(g => g.name === params.generator);
   if (remote) {
@@ -383,6 +385,73 @@ async function regenerate() {
 function rebuildAll() {
   clearGroup(groups.decor); gen.decorate?.(groups.decor);
   rebuildArrows(); rebuildLines(); resetParticles(); rebuildSlice(); updateLegend(); updateInfo();
+}
+
+// ---------------------------------------------------------------------------
+// Live stream (stream_server.py): WebSocket, binary frames, pull-based ("next" after each frame)
+// Frame: 40-byte little-endian header (see fieldstream.py) + nx*ny*nz*3 float32 or int16 values.
+// ---------------------------------------------------------------------------
+let live = null;
+function connectLive() {
+  if (live) return;
+  const url = new URL('ws/field', new URL(API_BASE || '.', location.href)).href.replace(/^http/, 'ws');
+  const ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+  live = { ws, meta: {}, frames: 0, fps: 0, bytes: 0, last: 0, refs: null, status: 'connecting…' };
+  updateLiveStatus();
+  ws.onopen = () => { live.status = 'waiting for producer…'; updateLiveStatus(); ws.send('next'); };
+  ws.onmessage = e => {
+    if (typeof e.data === 'string') { live.meta = JSON.parse(e.data); live.metaChanged = true; return; }
+    const t0 = performance.now();
+    try { applyLiveFrame(e.data); } catch (err) { console.error(err); live.status = 'bad frame: ' + err.message; }
+    // ask for the next frame no faster than the configured rate (server always sends the newest)
+    const wait = Math.max(0, 1000 / params.liveMaxFps - (performance.now() - t0));
+    setTimeout(() => ws.readyState === WebSocket.OPEN && ws.send('next'), wait);
+  };
+  ws.onclose = () => {
+    if (live?.ws !== ws) return;
+    live = null;
+    if (params.source === 'live stream') {
+      document.getElementById('stats').textContent = 'live: disconnected, retrying…';
+      setTimeout(() => params.source === 'live stream' && connectLive(), 2000);
+    }
+  };
+}
+function disconnectLive() { if (live) { const ws = live.ws; live = null; ws.close(); } }
+function updateLiveStatus() {
+  if (live && !live.frames) { document.getElementById('genName').textContent = 'Live stream';
+    document.getElementById('genDesc').textContent = 'Streaming from stream_server.py.'; document.getElementById('stats').textContent = 'live: ' + live.status; }
+}
+function applyLiveFrame(buf) {
+  const dv = new DataView(buf);
+  if (td.decode(new Uint8Array(buf, 0, 4)) !== 'VF01') throw new Error('bad magic');
+  const nx = dv.getUint32(8, true), ny = dv.getUint32(12, true), nz = dv.getUint32(16, true);
+  const dtype = dv.getUint8(20), scale = dv.getFloat32(24, true), n = nx * ny * nz * 3;
+  let data;
+  if (dtype === 0) data = new Float32Array(buf.slice(40, 40 + n * 4));
+  else if (dtype === 1) { const q = new Int16Array(buf, 40, n); data = new Float32Array(n); for (let i = 0; i < n; i++) data[i] = q[i] * scale; }
+  else throw new Error('unknown dtype ' + dtype);
+  const sameGrid = field && field.nx === nx && field.ny === ny && field.nz === nz && genName === live.meta.name;
+  field = new Field(nx, ny, nz, data); field.computeDerived();
+  // smooth the colour ranges over time so colours don't flicker frame to frame
+  const r = live.refs;
+  if (r && sameGrid) { field.ref = r.ref = 0.85 * r.ref + 0.15 * field.ref; field.vortRef = r.vort = 0.85 * r.vort + 0.15 * field.vortRef;
+    field.divRef = r.div = 0.85 * r.div + 0.15 * field.divRef; }
+  else live.refs = { ref: field.ref, vort: field.vortRef, div: field.divRef };
+  const now = performance.now();
+  if (live.last) live.fps = 0.8 * live.fps + 200 / (now - live.last);
+  live.last = now; live.frames++; live.bytes = buf.byteLength;
+  live.seq = dv.getUint32(4, true); live.time = dv.getFloat64(32, true);
+  const m = live.meta;
+  gen = { ...(GENERATORS[m.name] || {}), desc: (m.desc || '') + ' [live stream]', seeding: m.seeding || 'random' };
+  genName = m.name || 'Live stream';
+  if (!sameGrid) rebuildAll();     // new grid / scenario: full rebuild incl. particles
+  else {                           // same grid: particles keep flying through the updated field
+    if (params.arrows.show) rebuildArrows();
+    if (params.lines.show) rebuildLines();
+    if (params.slice.show) rebuildSlice();
+    updateLegend(); updateInfo();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -736,7 +805,8 @@ function updateInfo() {
   document.getElementById('genName').textContent = genName;
   document.getElementById('genDesc').textContent = gen.desc;
   document.getElementById('stats').innerHTML =
-    `source: ${genName === 'Custom field' ? 'file' : params.source === 'server API' && serverGens ? 'REST API' : 'browser'} · ` +
+    (live?.frames ? `live: frame ${live.seq} · t=${live.time.toFixed(1)}s · ${live.fps.toFixed(1)} fps · ${(live.bytes / 1024).toFixed(0)} KB/frame<br>` : '') +
+    `source: ${genName === 'Custom field' ? 'file' : live ? 'WebSocket stream' : params.source === 'server API' && serverGens ? 'REST API' : 'browser'} · ` +
     `grid ${field.nx}×${field.ny}×${field.nz} · max |v| ${field.maxSpeed.toFixed(2)} · p98 ${field.ref.toFixed(2)}<br>` +
     (params.arrows.show ? `arrows ${stats.arrows} · ` : '') +
     (params.lines.show ? `streamlines ${stats.lines} (${stats.verts} verts) · ` : '') +
@@ -1117,14 +1187,23 @@ syncUniforms();
 //  - served by server.py            -> API found on same origin, used by default
 //  - static server / file://        -> API probe fails, fields are generated in the browser
 //  - static page + API elsewhere    -> index.html?api=http://localhost:8000/
-try {
-  const r = await fetch(API_BASE + 'api/fields', { signal: AbortSignal.timeout(3000) });
-  if (r.ok && (r.headers.get('content-type') || '').includes('application/json')) {
-    serverGens = await r.json();
-    params.source = 'server API';
-    fData.add(params, 'source', ['server API', 'browser (JS)']).name('data source').onChange(withBusy(regenerate));
-  }
-} catch { /* opened as a static file: browser-side generators only */ }
+//  - served by stream_server.py     -> additionally a "live stream" source (default if a producer is active)
+const getJSON = async path => {
+  try {
+    const r = await fetch(API_BASE + path, { signal: AbortSignal.timeout(3000) });
+    return r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : null;
+  } catch { return null; }   // opened as a static file: browser-side generators only
+};
+const [gens, streamStatus] = await Promise.all([getJSON('api/fields'), getJSON('api/stream')]);
+if (gens) { serverGens = gens; params.source = 'server API'; }
+const sources = [...(gens ? ['server API'] : []), 'browser (JS)', ...(streamStatus ? ['live stream'] : [])];
+if (streamStatus && (streamStatus.frames > 0 || new URLSearchParams(location.search).has('live'))) params.source = 'live stream';
+if (sources.length > 1) {
+  const c = fData.add(params, 'source', sources).name('data source').onChange(withBusy(regenerate));
+  fData.children.splice(fData.children.indexOf(c), 1); fData.children.unshift(c);   // keep it first
+  fData.$children.prepend(c.domElement);
+}
+if (streamStatus) fData.add(params, 'liveMaxFps', 1, 30, 1).name('live max fps');
 withBusy(regenerate)();
 </script>
 </body>

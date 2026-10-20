@@ -1,0 +1,6 @@
+# Only needed for live streaming (stream_server.py, producer.py).
+# server.py and index.html need no packages.
+flask>=2.2
+flask-sock>=0.7
+pyzmq>=25
+numpy>=1.22
