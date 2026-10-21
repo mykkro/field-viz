@@ -1,6 +1,8 @@
 """Binary frame format + ZeroMQ publisher for streaming 3D vector fields to field-viz.
 
-Frame layout (little-endian), 40-byte header followed by the payload:
+Frame layout (little-endian), 40-byte header followed by the payload.
+Vectors use VF01 and (nz,ny,nx,3); scalars use SF01 and (nz,ny,nx),
+with one value per point. Optional metadata includes kind and units.
 
     offset  type     field
     0       4s       magic b"VF01"
@@ -40,12 +42,17 @@ DTYPES = {"float32": 0, "int16": 1}
 
 
 def encode_frame(v, seq=0, dtype="float32", timestamp=None):
-    """v: array of shape (nz, ny, nx, 3). Returns header + payload bytes."""
+    """Encode vectors (nz,ny,nx,3) as VF01 or scalars (nz,ny,nx) as SF01."""
     v = np.asarray(v)
-    if v.ndim != 4 or v.shape[3] != 3:
-        raise ValueError(f"expected shape (nz, ny, nx, 3), got {v.shape}")
-    nz, ny, nx, _ = v.shape
+    scalar = v.ndim == 3
+    if not scalar and (v.ndim != 4 or v.shape[3] != 3):
+        raise ValueError(f"expected (nz,ny,nx) or (nz,ny,nx,3), got {v.shape}")
+    nz, ny, nx = v.shape[:3]
+    if min(nx, ny, nz) < 2 or nx * ny * nz > 16000000:
+        raise ValueError('grid must have at least 2 points per axis and at most 16 million samples')
     if dtype == "int16":
+        if not np.isfinite(v).all():
+            raise ValueError('int16 cannot represent missing values; use float32')
         m = float(np.abs(v).max()) or 1.0
         scale = m / 32767.0
         payload = np.round(v / scale).astype("<i2").tobytes()
@@ -55,20 +62,27 @@ def encode_frame(v, seq=0, dtype="float32", timestamp=None):
     else:
         raise ValueError(f"dtype must be one of {list(DTYPES)}")
     ts = time.time() if timestamp is None else timestamp
-    return HEADER.pack(MAGIC, seq & 0xFFFFFFFF, nx, ny, nz, DTYPES[dtype], scale, 0, ts) + payload
+    return HEADER.pack(b"SF01" if scalar else MAGIC, seq & 0xFFFFFFFF, nx, ny, nz, DTYPES[dtype], scale, 0, ts) + payload
 
 
 def decode_frame(buf):
-    """Inverse of encode_frame. Returns (header dict, float32 array of shape (nz, ny, nx, 3))."""
+    """Inverse of encode_frame; returns metadata and a scalar or vector float32 array."""
+    if len(buf) < HEADER.size:
+        raise ValueError('truncated frame header')
     magic, seq, nx, ny, nz, code, scale, _, ts = HEADER.unpack_from(buf)
-    if magic != MAGIC:
+    if magic not in (MAGIC, b"SF01"):
         raise ValueError("bad magic")
-    n = nx * ny * nz * 3
+    scalar = magic == b"SF01"
+    if code not in (0, 1):
+        raise ValueError('unknown dtype')
+    n = nx * ny * nz * (1 if scalar else 3)
+    if min(nx, ny, nz) < 2 or nx * ny * nz > 16000000 or len(buf) != HEADER.size + n * (2 if code == 1 else 4):
+        raise ValueError('invalid grid or payload size')
     if code == 1:
         v = np.frombuffer(buf, "<i2", n, HEADER.size).astype(np.float32) * scale
     else:
         v = np.frombuffer(buf, "<f4", n, HEADER.size).astype(np.float32)
-    return {"seq": seq, "dims": (nx, ny, nz), "dtype": code, "time": ts}, v.reshape(nz, ny, nx, 3)
+    return {"seq": seq, "dims": (nx, ny, nz), "dtype": code, "time": ts, "kind": "scalar" if scalar else "vector"}, v.reshape((nz, ny, nx) if scalar else (nz, ny, nx, 3))
 
 
 class FieldPublisher:
@@ -82,9 +96,10 @@ class FieldPublisher:
         self.dtype = dtype
         self.seq = 0
 
-    def send(self, v, name="Live field", desc="", seeding="random", timestamp=None, origin=None, spacing=None):
+    def send(self, v, name="Live field", desc="", seeding="random", timestamp=None, origin=None, spacing=None, units=""):
         """origin/spacing: physical grid geometry (x, y, z); default is the cube [-1,1]^3."""
-        meta = {"name": name, "desc": desc, "seeding": seeding}
+        meta = {"name": name, "desc": desc, "seeding": seeding, "units": units,
+                "kind": "scalar" if np.ndim(v) == 3 else "vector"}
         if origin is not None:
             meta["origin"] = [float(c) for c in origin]
         if spacing is not None:

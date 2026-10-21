@@ -61,7 +61,13 @@ def charges(X, Y, Z, t, _rng):
     return v
 
 
+def heat(X, Y, Z, t, _rng):
+    width = .08 + .08 * (1 + np.sin(t * .5))
+    return np.exp(-((X-.25*np.sin(t*.4))**2 + Y*Y + Z*Z) / width)
+
+
 SCENARIOS = {
+    'heat': (heat, 'Live: heat pulse', 'A moving Gaussian heat pulse with changing width (illustrative scalar field).', 'random'),
     "tornado": (tornado, "Live: wandering tornado", "Tornado whose core wanders, leans and pulses in strength.", "ring"),
     "turbulence": (turbulence, "Live: evolving turbulence", "Mean wind with drifting, evolving divergence-free eddies.", "inlet"),
     "charges": (charges, "Live: orbiting charges", "Two sources and two sinks orbiting the z axis with pulsing strength.", "random"),

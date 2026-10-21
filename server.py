@@ -198,7 +198,48 @@ FORMATS = {
 }
 
 
+SCALAR_GENERATORS = {
+    'scalar_gaussian': ('Gaussian hot spot', '', lambda x,y,z: math.exp(-5*(x*x+y*y+z*z))),
+    'scalar_two': ('Two hot spots', '', lambda x,y,z: math.exp(-12*((x-.4)**2+y*y+z*z))+.8*math.exp(-12*((x+.4)**2+y*y+z*z))),
+    'scalar_temperature': ('Atmospheric temperature', '°C', lambda x,y,z: 18-6*(z+1)+5*math.exp(-35*(z-.2)**2)+10*math.exp(-9*(x*x+y*y)-3*(z+.5)**2)),
+    'scalar_potential': ('Electric dipole potential', 'arb.', lambda x,y,z: 1/math.sqrt((x-.4)**2+y*y+z*z+.02)-1/math.sqrt((x+.4)**2+y*y+z*z+.02)),
+    'scalar_charge': ('Signed charge density', 'arb.', lambda x,y,z: math.exp(-15*((x-.4)**2+y*y+z*z))-math.exp(-15*((x+.4)**2+y*y+z*z))),
+    'scalar_heat': ('Heat pulse', '', lambda x,y,z: math.exp(-8*(x*x+y*y+z*z))),
+    'scalar_gyroid': ('Gyroid', '', lambda x,y,z: math.sin(3*x)*math.cos(3*y)+math.sin(3*y)*math.cos(3*z)+math.sin(3*z)*math.cos(3*x)),
+}
+
+
+def scalar_export(field, fmt):
+    nx, ny, nz = field['dims']
+    raw = _float32_bytes(field['data'])
+    if fmt == 'npy':
+        header = f"{{'descr': '<f4', 'fortran_order': False, 'shape': ({nz}, {ny}, {nx}), }}"
+        header = header.ljust(-(-(10 + len(header) + 1) // 64) * 64 - 11) + '\n'
+        return b'\x93NUMPY\x01\x00' + struct.pack('<H', len(header)) + header.encode() + raw
+    spacing = ' '.join(f'{s:.12g}' for s in field['spacing'])
+    if fmt == 'vtk':
+        return (f'# vtk DataFile Version 3.0\nscalar field\nBINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS {nx} {ny} {nz}\nORIGIN -1 -1 -1\nSPACING {spacing}\nPOINT_DATA {nx*ny*nz}\nSCALARS scalar float 1\nLOOKUP_TABLE default\n').encode() + _float32_bytes(field['data'], big_endian=True) + b'\n'
+    if fmt == 'vti':
+        ext = f'0 {nx-1} 0 {ny-1} 0 {nz-1}'
+        payload = base64.b64encode(struct.pack('<I', len(raw)) + raw).decode()
+        return (f'<?xml version="1.0"?><VTKFile type="ImageData" byte_order="LittleEndian" header_type="UInt32"><ImageData WholeExtent="{ext}" Origin="-1 -1 -1" Spacing="{spacing}"><Piece Extent="{ext}"><PointData Scalars="scalar"><DataArray type="Float32" Name="scalar" NumberOfComponents="1" format="binary">{payload}</DataArray></PointData></Piece></ImageData></VTKFile>').encode()
+    lines = ['# field-viz ' + json.dumps({'name': field['name'], 'units': field['units']}), 'x,y,z,value']
+    p = 0
+    for k in range(nz):
+        for j in range(ny):
+            for i in range(nx):
+                lines.append(','.join(str(v) for v in (-1+i*field['spacing'][0], -1+j*field['spacing'][1], -1+k*field['spacing'][2], field['data'][p])))
+                p += 1
+    return ('\n'.join(lines)+'\n').encode()
+
+
 def build_field(gen_id, n, seed):
+    if gen_id in SCALAR_GENERATORS:
+        name, units, fn = SCALAR_GENERATORS[gen_id]
+        coords = [-1 + 2*i/(n-1) for i in range(n)]
+        return {'id': gen_id, 'name': name, 'kind': 'scalar', 'units': units, 'desc': 'Synthetic scalar example.',
+                'dims': [n,n,n], 'origin': [-1,-1,-1], 'spacing': [2/(n-1)]*3,
+                'data': [fn(x,y,z) for z in coords for y in coords for x in coords]}
     name, desc, seeding, make = GENERATORS[gen_id]
     f = make(seed)
     coords = [-1 + 2 * i / (n - 1) for i in range(n)]
@@ -212,7 +253,8 @@ def build_field(gen_id, n, seed):
 
 
 def list_generators():
-    return [{"id": k, "name": v[0], "desc": v[1], "seeding": v[2]} for k, v in GENERATORS.items()]
+    return ([{"id": k, "name": v[0], "desc": v[1], "seeding": v[2], 'kind': 'vector'} for k, v in GENERATORS.items()]
+            + [{'id': k, 'name': v[0], 'kind': 'scalar', 'units': v[1], 'desc': 'Synthetic scalar example.'} for k,v in SCALAR_GENERATORS.items()])
 
 
 def field_response(gen_id, query):
@@ -220,7 +262,7 @@ def field_response(gen_id, query):
     query: dict of str -> str. Returns (status, content_type, body_bytes, extra_headers)."""
     def err(status, msg):
         return status, "application/json", json.dumps({"error": msg}).encode(), {}
-    if gen_id not in GENERATORS:
+    if gen_id not in GENERATORS and gen_id not in SCALAR_GENERATORS:
         return err(404, "unknown generator")
     try:
         n = int(query.get("n", "24"))
@@ -236,7 +278,8 @@ def field_response(gen_id, query):
     if fmt == "json":
         return 200, "application/json", json.dumps(field, separators=(",", ":")).encode(), {}
     writer, ctype, ext = FORMATS[fmt]
-    return 200, ctype, writer(field), {"Content-Disposition": f'attachment; filename="{gen_id}_{n}x{n}x{n}.{ext}"'}
+    body = scalar_export(field, fmt) if field.get('kind') == 'scalar' else writer(field)
+    return 200, ctype, body, {"Content-Disposition": f'attachment; filename="{gen_id}_{n}x{n}x{n}.{ext}"'}
 
 
 # ---------------------------------------------------------------------------

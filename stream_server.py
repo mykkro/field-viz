@@ -153,6 +153,11 @@ def examples(p):
     return send_from_directory(ROOT / "examples", p)
 
 
+@app.get("/vendor/<path:p>")
+def vendor(p):
+    return send_from_directory(ROOT / "vendor", p)
+
+
 @app.after_request
 def cors(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"

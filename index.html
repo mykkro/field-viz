@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Vector Field Viewer</title>
+<title>3D Field Viewer</title>
 <link rel="icon" href="data:,">
 <style>
   :root { --bg:#0e1116; --panel:rgba(16,20,27,.82); --fg:#dfe3ea; --muted:#9aa4b2; }
@@ -42,14 +42,18 @@
       max-height:calc(100dvh - 140px); }
   }
 </style>
-<script type="importmap">
-{
-  "imports": {
-    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
-    "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19.2/dist/lil-gui.esm.js"
-  }
-}
+<script>
+// HTTP servers use bundled, pinned libraries. Direct file:// opening retains CDN loading
+// because browsers block ES modules imported from neighboring local files.
+const localLibraries = location.protocol !== 'file:';
+const importMap = document.createElement('script');
+importMap.type = 'importmap';
+importMap.textContent = JSON.stringify({ imports: {
+  'three': localLibraries ? './vendor/three/build/three.module.js' : 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js',
+  'three/addons/': localLibraries ? './vendor/three/examples/jsm/' : 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/',
+  'lil-gui': localLibraries ? './vendor/lil-gui/lil-gui.esm.js' : 'https://cdn.jsdelivr.net/npm/lil-gui@0.19.2/dist/lil-gui.esm.js'
+} });
+document.head.appendChild(importMap);
 </script>
 </head>
 <body>
@@ -67,7 +71,7 @@
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { mergeGeometries, mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 import GUI from 'lil-gui';
 
 // ---------------------------------------------------------------------------
@@ -396,6 +400,7 @@ const API_BASE = (() => { const a = new URLSearchParams(location.search).get('ap
 async function regenerate() {
   if (params.source === 'live stream') return connectLive();
   disconnectLive();
+  if (params.mode === 'Scalar') return regenerateScalar();
   const n = params.resolution;
   const remote = params.source === 'server API' && serverGens?.find(g => g.name === params.generator);
   if (remote) {
@@ -417,6 +422,8 @@ async function regenerate() {
 
 function rebuildAll() {
   clearGroup(groups.decor); gen.decorate?.(groups.decor); updateBox();
+  if (field.scalar) { rebuildScalar(); updateLegend(); updateInfo(); return; }
+  clearGroup(groups.scalar);
   rebuildArrows(); rebuildLines(); resetParticles(); rebuildSlice(); updateLegend(); updateInfo();
 }
 
@@ -456,17 +463,29 @@ function updateLiveStatus() {
     document.getElementById('genDesc').textContent = 'Streaming from stream_server.py.'; document.getElementById('stats').textContent = 'live: ' + live.status; }
 }
 function applyLiveFrame(buf) {
+  if (buf.byteLength < 40) throw new Error('truncated frame header');
   const dv = new DataView(buf);
-  if (td.decode(new Uint8Array(buf, 0, 4)) !== 'VF01') throw new Error('bad magic');
+  const magic = td.decode(new Uint8Array(buf, 0, 4)), scalar = magic === 'SF01';
+  if (magic !== 'VF01' && !scalar) throw new Error('bad magic');
   const nx = dv.getUint32(8, true), ny = dv.getUint32(12, true), nz = dv.getUint32(16, true);
-  const dtype = dv.getUint8(20), scale = dv.getFloat32(24, true), n = nx * ny * nz * 3;
+  const dtype = dv.getUint8(20), scale = dv.getFloat32(24, true), n = nx * ny * nz * (scalar ? 1 : 3);
+  if (![nx,ny,nz].every(v=>v>=2) || nx*ny*nz>16000000 || buf.byteLength !== 40+n*(dtype===0?4:2)) throw new Error('invalid grid or frame size');
   let data;
   if (dtype === 0) data = new Float32Array(buf.slice(40, 40 + n * 4));
   else if (dtype === 1) { const q = new Int16Array(buf, 40, n); data = new Float32Array(n); for (let i = 0; i < n; i++) data[i] = q[i] * scale; }
   else throw new Error('unknown dtype ' + dtype);
   const m = live.meta;   // optional physical "origin"/"spacing" come with the meta message
-  const sameGrid = field && field.nx === nx && field.ny === ny && field.nz === nz && genName === m.name && !live.metaChanged;
+  const sameGrid = field && !!field.scalar === scalar && field.nx === nx && field.ny === ny && field.nz === nz && genName === m.name && !live.metaChanged;
   live.metaChanged = false;
+  if (scalar) {
+    field=makeScalar({dims:[nx,ny,nz],data,origin:m.origin||[-1,-1,-1],spacing:m.spacing||[2/(nx-1),2/(ny-1),2/(nz-1)],name:m.name,units:m.units});
+    params.mode='Scalar';genName=m.name||'Live scalar';gen={desc:m.desc||'Live scalar field'};
+    if(!sameGrid){scalarDefaults(scalarState.sorted[0]<0&&scalarState.sorted.at(-1)>0);params.scalar.range='Manual';syncMode();}
+    const now=performance.now();if(live.last)live.fps=.8*live.fps+200/(now-live.last);live.last=now;
+    live.frames++;live.seq=dv.getUint32(4,true);live.time=dv.getFloat64(32,true);live.bytes=buf.byteLength;
+    rebuildAll();return;
+  }
+  if(params.mode!=='Vector'){params.mode='Vector';syncMode();}
   field = new Field(nx, ny, nz, data, m.origin, m.spacing); field.computeDerived();
   // smooth the colour ranges over time so colours don't flicker frame to frame
   const r = live.refs;
@@ -827,7 +846,7 @@ function rebuildSlice() {
   g.setAttribute('position', new THREE.Float32BufferAttribute(corners.flat(), 3));
   g.setAttribute('uv', new THREE.Float32BufferAttribute([0, 0, 1, 0, 1, 1, 0, 1], 2));
   g.setIndex([0, 1, 2, 0, 2, 3]);
-  const mesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide,
+  const mesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide, forceSinglePass: true,
     transparent: S.opacity < 1, opacity: S.opacity, depthWrite: S.opacity >= 1 }));
   const frame = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(corners.map(c => new THREE.Vector3(...c))),
     new THREE.LineBasicMaterial({ color: 0xcfd6e0 }));
@@ -851,6 +870,7 @@ function legendRow(cm, lo, hi, label) {
 }
 function updateLegend() {
   const el = document.getElementById('legend'); el.innerHTML = '';
+  if (field.scalar) { scalarLegend(el); return; }
   if (params.arrows.show || params.lines.show || params.particles.show || (params.slice.show && params.slice.quantity === 'speed'))
     el.appendChild(legendRow(params.colormap, 0, field.ref, 'Speed |v|'));
   if (params.slice.show && (params.slice.quantity !== 'speed' || params.slice.palette !== 'auto')) { const q = quantityInfo(params.slice.quantity); el.appendChild(legendRow(q.cm, q.lo, q.hi, q.label)); }
@@ -859,6 +879,7 @@ function updateLegend() {
 function updateInfo() {
   document.getElementById('genName').textContent = genName;
   document.getElementById('genDesc').textContent = gen.desc;
+  if (field.scalar) { scalarInfo(); return; }
   document.getElementById('stats').innerHTML =
     (live?.frames ? `live: frame ${live.seq} · t=${live.time.toFixed(1)}s · ${live.fps.toFixed(1)} fps · ${(live.bytes / 1024).toFixed(0)} KB/frame<br>` : '') +
     `source: ${genName === 'Custom field' ? 'file' : live ? 'WebSocket stream' : params.source === 'server API' && serverGens ? 'REST API' : 'browser'} · ` +
@@ -903,7 +924,7 @@ const syncUniforms = () => {
 
 // Lighter defaults on phones/tablets
 if (isMobile) { params.resolution = 20; params.lines.count = 100; params.particles.count = 1500; }
-const gui = new GUI({ title: 'Vector field', width: Math.min(280, innerWidth - 24) });
+const gui = new GUI({ title: '3D field', width: Math.min(280, innerWidth - 24) });
 const fData = gui.addFolder('Data');
 fData.add(params, 'generator', Object.keys(GENERATORS)).onChange(withBusy(regenerate));
 fData.add(params, 'resolution', 8, 48, 1).name('grid size').onFinishChange(withBusy(regenerate));
@@ -1038,8 +1059,8 @@ const FORMATS = {
       if (!r.line().startsWith('# vtk')) throw new Error('missing "# vtk DataFile" header');
       r.line();   // title
       const bin = (r.next() || '').toUpperCase() === 'BINARY';
-      let dims, n = 0, cell = false, vec = null, origin, spacing, dataset, points, coords = [];
-      for (let l; !vec && (l = r.next()) !== null;) {
+      let dims, n = 0, cell = false, vec = null, scal = null, scalarName, origin, spacing, dataset, points, coords = [];
+      for (let l; !(vec && params.mode !== 'Scalar') && !(scal && params.mode === 'Scalar') && (l = r.next()) !== null;) {
         const t = l.split(/\s+/), kw = t[0].toUpperCase();
         if (kw === 'DATASET') {
           dataset = t[1].toUpperCase();
@@ -1056,7 +1077,8 @@ const FORMATS = {
         else if (kw === 'SCALARS') {
           const nc = +(t[3] || 1), lt = r.next();
           if (!/^LOOKUP_TABLE/i.test(lt)) throw new Error('SCALARS without LOOKUP_TABLE');
-          r.values(n * nc, typeCode(VTK_T, t[2]), bin);
+          const values = r.values(n * nc, typeCode(VTK_T, t[2]), bin);
+          if (!cell && nc === 1 && !scal) { scal = values; scalarName = t[1]; }
         }
         else if (kw === 'LOOKUP_TABLE') r.values(+t[2] * 4, bin ? 'u1' : 'f4', bin);
         else if (kw === 'FIELD') {
@@ -1068,7 +1090,9 @@ const FORMATS = {
         else if (['COLOR_SCALARS', 'TEXTURE_COORDINATES', 'TENSORS'].includes(kw)) throw new Error(`unsupported section ${kw} before the vectors`);
       }
       if (!dims) throw new Error('no DIMENSIONS found');
-      if (!vec) throw new Error('no point VECTORS (or 3-component FIELD array) found');
+      const scalar = !!scal && (params.mode === 'Scalar' || !vec);
+      if (scalar) vec = scal;
+      if (!vec) throw new Error('no point vectors or scalars found');
       if (dataset === 'RECTILINEAR_GRID') {   // expand per-axis coordinates into points
         if (coords.length < 3 || coords.some(c => !c)) throw new Error('RECTILINEAR_GRID without X/Y/Z_COORDINATES');
         const [nx, ny, nz] = dims; points = new Float64Array(nx * ny * nz * 3); let p = 0;
@@ -1077,9 +1101,9 @@ const FORMATS = {
       }
       if (dataset !== 'STRUCTURED_POINTS' && dataset) {
         if (!points || points.length !== dims[0] * dims[1] * dims[2] * 3) throw new Error('POINTS missing or not matching DIMENSIONS');
-        return { dims, data: Float32Array.from(vec), points, grid: dataset };
+        return { dims, data: Float32Array.from(vec), scalar, name: scalarName, points, grid: dataset };
       }
-      return { dims, data: Float32Array.from(vec), origin, spacing };
+      return { dims, data: Float32Array.from(vec), scalar, name: scalarName, origin, spacing };
     },
     write(f) {
       const N = f.nx * f.ny * f.nz, dv = new DataView(new ArrayBuffer(N * 12));
@@ -1099,13 +1123,17 @@ const FORMATS = {
       if (root.getAttribute('compressor')) throw new Error('compressed .vti is not supported (save uncompressed)');
       const img = doc.querySelector('ImageData'), attr = k => img.getAttribute(k)?.trim().split(/\s+/).map(Number);
       const e = attr('WholeExtent'), origin = attr('Origin'), spacing = attr('Spacing');
-      const dims = [e[1] - e[0] + 1, e[3] - e[2] + 1, e[5] - e[4] + 1], N = dims[0] * dims[1] * dims[2] * 3;
+      const dims = [e[1] - e[0] + 1, e[3] - e[2] + 1, e[5] - e[4] + 1];
       const pd = doc.querySelector('PointData'), arrays = [...(pd?.querySelectorAll('DataArray') || [])];
       const vname = pd?.getAttribute('Vectors');
-      const da = arrays.find(a => vname && a.getAttribute('Name') === vname) || arrays.find(a => a.getAttribute('NumberOfComponents') === '3');
-      if (!da) throw new Error('no 3-component PointData array found');
+      const vectorArray = arrays.find(a => vname && a.getAttribute('Name') === vname) || arrays.find(a => a.getAttribute('NumberOfComponents') === '3');
+      const scalarArray = arrays.find(a => (a.getAttribute('NumberOfComponents') || '1') === '1');
+      const da = params.mode === 'Scalar' ? scalarArray || vectorArray : vectorArray || scalarArray;
+      if (!da) throw new Error('no scalar or vector PointData array found');
+      const scalar = (da.getAttribute('NumberOfComponents') || '1') === '1', N = dims.reduce((a,b)=>a*b,1) * (scalar ? 1 : 3);
+      const metadata = { scalar, name: da.getAttribute('Name'), origin: origin?.map((v,a)=>v+e[a*2]*(spacing?.[a] || 1)), spacing };
       const fmt = da.getAttribute('format');
-      if (fmt === 'ascii') return { dims, data: Float32Array.from(da.textContent.trim().split(/\s+/), Number), origin, spacing };
+      if (fmt === 'ascii') return { dims, data: Float32Array.from(da.textContent.trim().split(/\s+/), Number), ...metadata };
       if (fmt !== 'binary') throw new Error('"appended" .vti data is not supported (use ascii or binary)');
       const code = typeCode(VTI_T, da.getAttribute('type')), little = root.getAttribute('byte_order') !== 'BigEndian';
       const hdr = root.getAttribute('header_type') === 'UInt64' ? 8 : 4, s = da.textContent.replace(/\s+/g, '');
@@ -1114,7 +1142,7 @@ const FORMATS = {
       const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength), data = new Float32Array(N);
       if (bytes.byteLength < N * SZ[code]) throw new Error('binary data shorter than expected');
       for (let i = 0; i < N; i++) data[i] = RD[code](dv, i * SZ[code], little);
-      return { dims, data, origin, spacing };
+      return { dims, data, ...metadata };
     },
     write(f) {
       const raw = new Uint8Array(4 + f.v.byteLength), dv = new DataView(raw.buffer);
@@ -1139,7 +1167,12 @@ const FORMATS = {
       const shape = (/'shape'\s*:\s*\(([^)]*)\)/.exec(hdr)?.[1] || '').split(',').map(s => s.trim()).filter(Boolean).map(Number);
       const code = descr.slice(1), little = descr[0] !== '>';
       if (!RD[code]) throw new Error(`unsupported dtype ${descr}`);
-      if (shape.length !== 4) throw new Error(`expected a 4-D array (nz,ny,nx,3), got shape (${shape})`);
+      if (shape.length === 3) {
+        const [nz,ny,nx]=shape, data=new Float32Array(nx*ny*nz), sz=SZ[code], base=off+hlen;
+        for(let k=0;k<nz;k++)for(let j=0;j<ny;j++)for(let i=0;i<nx;i++)data[(k*ny+j)*nx+i]=RD[code](dv,base+(fortran?(i*ny+j)*nz+k:(k*ny+j)*nx+i)*sz,little);
+        return {dims:[nx,ny,nz],data,scalar:true};
+      }
+      if (shape.length !== 4) throw new Error(`expected scalar (nz,ny,nx) or vector (nz,ny,nx,3), got shape (${shape})`);
       const st = [0, 0, 0, 0];   // element strides
       if (fortran) { let s = 1; for (let d = 0; d < 4; d++) { st[d] = s; s *= shape[d]; } }
       else { let s = 1; for (let d = 3; d >= 0; d--) { st[d] = s; s *= shape[d]; } }
@@ -1198,7 +1231,8 @@ const FORMATS = {
   'JSON (.json)': {
     ext: 'json', mime: 'application/json',
     read(buf) { const j = JSON.parse(td.decode(buf));
-      return { dims: j.dims || [j.nx, j.ny, j.nz], data: Float32Array.from(j.data), origin: j.origin, spacing: j.spacing }; },
+      const dims=j.dims || [j.nx,j.ny,j.nz];
+      return { dims, data: Float32Array.from(j.data, v=>v===null?NaN:v), scalar:j.kind==='scalar'||j.data.length===dims.reduce((a,b)=>a*b,1), name:j.name, units:j.units, mask:j.mask, origin: j.origin, spacing: j.spacing }; },
     write(f) { return [JSON.stringify({ dims: [f.nx, f.ny, f.nz], origin: f.origin, spacing: f.spacing, data: Array.from(f.v, x => +x.toFixed(5)) })]; },
   },
 };
@@ -1322,7 +1356,7 @@ function addTerrain(g, t) {
 }
 
 function exportField() {
-  const fmt = FORMATS[params.exportFormat];
+  const fmt = field.scalar ? scalarFormat(params.exportFormat) : FORMATS[params.exportFormat];
   const blob = new Blob(fmt.write(field), { type: fmt.mime });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
   a.download = `${genName.replace(/\W+/g, '_')}_${field.nx}x${field.ny}x${field.nz}.${fmt.ext}`;
@@ -1335,7 +1369,9 @@ async function importBuffer(fileName, getBuffer) {
   try {
     const name = EXT_FORMAT[fileName.split('.').pop().toLowerCase()];
     if (!name) throw new Error('unknown extension (use .vtk, .vti, .npy, .csv or .json)');
-    let res = FORMATS[name].read(await getBuffer()), note = '';
+    const buffer = await getBuffer();
+    let res = readScalarFile(name, buffer) || FORMATS[name].read(buffer), note = '';
+    if (res.scalar) { installScalar(res, fileName); return; }
     if (res.points) {
       const src = res.dims.join('×'), grid = res.grid;
       res = resampleStructured(res.dims, res.points, res.data);
@@ -1349,6 +1385,7 @@ async function importBuffer(fileName, getBuffer) {
     const sp = spacing?.length === 3 && spacing.every(s => s > 0) ? spacing : [1, 1, 1];
     disconnectLive();
     field = new Field(nx, ny, nz, data, origin?.length === 3 ? origin : [0, 0, 0], sp);
+    params.mode = 'Vector'; syncMode();
     if (res.mask?.some(m => m)) field.setMask(res.mask);
     field.computeDerived();
     const terrain = res.terrain;
@@ -1363,17 +1400,353 @@ document.getElementById('fileInput').addEventListener('change', e => { if (e.tar
 addEventListener('dragover', e => e.preventDefault());
 addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer.files[0]) importFile(e.dataTransfer.files[0]); });
 fData.add({ load: () => document.getElementById('fileInput').click() }, 'load').name('Import file… (or drop)');
-fData.add({ example: () => importBuffer('windninja_like.vtk', async () => {
-  const r = await fetch('examples/windninja_like.vtk');
-  if (!r.ok) throw new Error(`HTTP ${r.status} (serve the folder over HTTP to load examples)`);
-  return r.arrayBuffer();
-}) }, 'example').name('Load example: terrain wind');
+const exampleControl = fData.add({ example: () => {
+  const file = params.mode === 'Scalar' ? 'temperature_plume.json' : 'windninja_like.vtk';
+  return importBuffer(file, async () => {
+    let r;
+    try { r = await fetch(`examples/${file}`); } catch { /* file:// cannot fetch local files */ }
+    if (!r?.ok) throw new Error(`Could not fetch example. Serve the page over HTTP, or drag examples/${file} onto it.`);
+    return r.arrayBuffer();
+  });
+} }, 'example').name('Load example: terrain wind');
 fData.add(params, 'exportFormat', Object.keys(FORMATS)).name('export format');
 fData.add({ save: () => exportField() }, 'save').name('Export current field');
 
 // ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
+// Scalar fields share grid geometry and interpolation with vectors, but store one value per node.
+params.mode = 'Vector';
+params.scalar = {
+  example: 'Gaussian hot spot', preset: 'Slices + surface',
+  x: true, y: true, z: true, px: 0, py: 0, pz: 0, sliceOpacity: 0.85,
+  surfaces: true, levels: '0.25, 0.6', surfaceOpacity: 0.65,
+  volume: false, projection: 'Composite', density: 3, opacityLow: 0, opacityHigh: 1, opacityPower: 1, steps: isMobile ? 80 : 160,
+  points: false, voxels: false, stride: 2, pointSize: 0.025, thresholdLow: 0, thresholdHigh: 1,
+  range: 'Full', min: 0, max: 1, center: 0, scale: 'Linear', linthresh: 1,
+  clipX: 1, clipY: 1, clipZ: 1, clipMinX: -1, clipMinY: -1, clipMinZ: -1, probeX: 0, probeY: 0, probeZ: 0,
+};
+const SCALAR_EXAMPLES = {
+  'Gaussian hot spot': { units: '', desc: 'A smooth Gaussian peak; values are dimensionless.', fn: (x,y,z) => Math.exp(-5*(x*x+y*y+z*z)) },
+  'Two hot spots': { units: '', desc: 'Two overlapping Gaussian peaks. Change the isovalue to split or join the surfaces.', fn: (x,y,z) => Math.exp(-12*((x-.4)**2+y*y+z*z)) + .8*Math.exp(-12*((x+.4)**2+y*y+z*z)) },
+  'Atmospheric temperature': { units: '°C', desc: 'Illustrative temperature with a lapse rate, inversion and warm plume; not a solved atmosphere.', fn: (x,y,z) => 18-6*(z+1)+5*Math.exp(-35*(z-.2)**2)+10*Math.exp(-9*(x*x+y*y)-3*(z+.5)**2) },
+  'Electric dipole potential': { units: 'arb.', signed: true, desc: 'Softened dipole potential, distinct from the vector electric field. Dimensionless illustrative units.', fn: (x,y,z) => 1/Math.sqrt((x-.4)**2+y*y+z*z+.02)-1/Math.sqrt((x+.4)**2+y*y+z*z+.02) },
+  'Signed charge density': { units: 'arb.', signed: true, desc: 'Positive and negative Gaussian charge-density blobs.', fn: (x,y,z) => Math.exp(-15*((x-.4)**2+y*y+z*z))-Math.exp(-15*((x+.4)**2+y*y+z*z)) },
+  'Heat pulse': { units: '', desc: 'A Gaussian heat pulse snapshot; producer.py --scenario heat streams an evolving version.', fn: (x,y,z) => Math.exp(-8*(x*x+y*y+z*z)) },
+  'Gyroid': { units: '', signed: true, desc: 'Periodic scalar field; the zero isosurface is a gyroid.', fn: (x,y,z) => Math.sin(3*x)*Math.cos(3*y)+Math.sin(3*y)*Math.cos(3*z)+Math.sin(3*z)*Math.cos(3*x) },
+};
+groups.scalar = new THREE.Group(); scene.add(groups.scalar);
+renderer.localClippingEnabled = true;
+const scalarState = { sorted: [], lo: 0, hi: 1, triangles: 0, samples: 0 };
+function makeScalar(res) {
+  const dims = res.dims;
+  if (!Array.isArray(dims) || dims.length !== 3 || !dims.every(n => Number.isInteger(n) && n >= 2) || dims.reduce((a,b)=>a*b,1) > 16000000)
+    throw new Error('Scalar grid must have 2 or more points per axis and at most 16 million samples.');
+  const N = dims.reduce((a,b)=>a*b,1);
+  if (res.data.length !== N) throw new Error(`Expected ${N} scalar samples, got ${res.data.length}.`);
+  const origin = res.origin || [0,0,0], spacing = res.spacing || [1,1,1];
+  if (origin.length !== 3 || !origin.every(Number.isFinite) || spacing.length !== 3 || !spacing.every(v=>Number.isFinite(v)&&v>0)) throw new Error('Invalid origin or spacing.');
+  // Field methods use the same geometry; avoid allocating vector and derivative arrays.
+  const f = Object.create(Field.prototype);
+  Object.assign(f, { nx:dims[0], ny:dims[1], nz:dims[2], dims, origin, spacing, scalar: Float32Array.from(res.data), units:res.units || '', scalarName:res.name || 'Scalar value' });
+  f.extent = spacing.map((v,a)=>v*(dims[a]-1)); f.setDisplay();
+  const mask = Uint8Array.from(f.scalar, (v,i)=>!Number.isFinite(v) || !!res.mask?.[i] ? 1 : 0);
+  f.setMask(mask);
+  f.scalar.forEach((v,i)=>{ if (mask[i]) f.scalar[i]=0; });
+  scalarState.sorted = Array.from(f.scalar).filter((v,i)=>!mask[i]).sort((a,b)=>a-b);
+  if (!scalarState.sorted.length) throw new Error('No finite, unmasked scalar samples.');
+  return f;
+}
+function scalarDefaults(signed=false) {
+  const S=params.scalar, a=scalarState.sorted, lo=a[0], hi=a.at(-1);
+  S.min=lo; S.max=hi>lo?hi:lo+1; S.center=0; S.range=signed?'Centered':'Full';
+  S.thresholdLow=lo; S.thresholdHigh=hi;
+  S.levels=(signed?[-.4,0,.4].map(t=>t*Math.max(Math.abs(lo),Math.abs(hi))):[.25,.6].map(t=>lo+t*(hi-lo))).map(v=>+v.toPrecision(4)).join(', ');
+  params.colormap=signed?'RdBu':'viridis';
+  gui.controllersRecursive().forEach(c=>c.updateDisplay());
+}
+async function regenerateScalar() {
+  const S=params.scalar, ex=SCALAR_EXAMPLES[S.example], n=params.resolution;
+  const remote=params.source==='server API' && serverGens?.find(g=>g.kind==='scalar' && g.name===S.example);
+  let res;
+  if(remote) { const r=await fetch(`${API_BASE}api/fields/${remote.id}?n=${n}`); res=await r.json(); if(!r.ok) throw new Error(res.error); }
+  else { const data=new Float32Array(n*n*n); let p=0;
+    for(let k=0;k<n;k++) for(let j=0;j<n;j++) for(let i=0;i<n;i++) data[p++]=ex.fn(-1+2*i/(n-1),-1+2*j/(n-1),-1+2*k/(n-1));
+    res={dims:[n,n,n],data,origin:[-1,-1,-1],spacing:[2/(n-1),2/(n-1),2/(n-1)],name:S.example,units:ex.units}; }
+  field=makeScalar(res); genName=S.example; gen={desc:ex.desc}; scalarDefaults(ex.signed); rebuildAll();
+}
+function installScalar(res, filename) {
+  if(res.points) throw new Error('Scalar structured-grid import currently requires a regular .vti grid.');
+  const next=makeScalar(res); disconnectLive(); field=next;
+  params.mode='Scalar'; genName='Custom field'; gen={desc:`Loaded scalar field from ${filename}.`};
+  scalarDefaults(scalarState.sorted[0]<0 && scalarState.sorted.at(-1)>0); syncMode(); rebuildAll(); busy.style.display='none';
+}
+function scalarRange() {
+  const S=params.scalar,a=scalarState.sorted; let lo,hi;
+  if(S.range==='Manual') { lo=S.min; hi=S.max; }
+  else if(S.range==='Percentile 2–98') { lo=a[Math.floor((a.length-1)*.02)]; hi=a[Math.floor((a.length-1)*.98)]; }
+  else { lo=a[0]; hi=a.at(-1); }
+  if(S.range==='Centered') { const r=Math.max(Math.abs(lo-S.center),Math.abs(hi-S.center)); lo=S.center-r; hi=S.center+r; }
+  if(!(hi>lo)) hi=lo+1;
+  if(S.scale==='Log' && lo<=0) throw new Error('Log scale requires a positive color range. Use Symmetric log for signed data.');
+  scalarState.lo=lo; scalarState.hi=hi; return [lo,hi];
+}
+function scalarTransform(v) {
+  const S=params.scalar;
+  return S.scale==='Log'?Math.log(Math.max(v,1e-30)):S.scale==='Symmetric log'?Math.sign(v)*Math.log1p(Math.abs(v)/S.linthresh):v;
+}
+function scalarT(v) { const a=scalarTransform(scalarState.lo), b=scalarTransform(scalarState.hi); return (scalarTransform(v)-a)/(b-a); }
+function scalarPlanes() {
+  const upper=['clipX','clipY','clipZ'].map((key,a)=>new THREE.Plane(new THREE.Vector3(...[0,1,2].map(i=>i===a?-1:0)),params.scalar[key]*field.hi[a]));
+  const lower=['clipMinX','clipMinY','clipMinZ'].map((key,a)=>new THREE.Plane(new THREE.Vector3(...[0,1,2].map(i=>i===a?1:0)),-params.scalar[key]*field.hi[a]));
+  return [...upper,...lower];
+}
+function scalarMaterial(extra={}) { return {clippingPlanes:scalarPlanes(),...extra}; }
+function rebuildScalar() {
+  scalarRange();
+  for(const key of ['arrows','lines','particles','slice','scalar']) clearGroup(groups[key]);
+  scalarState.triangles=0; scalarState.samples=0;
+  const S=params.scalar;
+  for(const [a,key] of ['x','y','z'].entries()) if(S[key]) scalarSlice(a,S['p'+key]);
+  if(S.surfaces) scalarSurfaces();
+  if(S.points || S.voxels) scalarPoints();
+  if(S.volume) scalarVolume();
+}
+function scalarSlice(ax,pos) {
+  const previous=groups.scalar.children.find(o=>o.userData.scalarSliceAxis===ax);
+  if(previous){clearGroup(previous);groups.scalar.remove(previous);}
+  const S=params.scalar, lower=[S.clipMinX,S.clipMinY,S.clipMinZ], upper=[S.clipX,S.clipY,S.clipZ];
+  if(pos<lower[ax] || pos>upper[ax] || lower.some((v,a)=>v>=upper[a]))return;
+  const R=128, data=new Uint8Array(R*R*4), rgb=[0,0,0], [ua,va]=[[1,2],[0,2],[0,1]][ax];
+  // Trim the plane itself to the clip box: coplanar fragment clipping can hide a whole face.
+  const world=(u,v)=>{const p=[0,0,0];p[ax]=pos;p[ua]=lower[ua]+(u+1)*.5*(upper[ua]-lower[ua]);p[va]=lower[va]+(v+1)*.5*(upper[va]-lower[va]);return field.normToWorld(p);};
+  for(let j=0;j<R;j++) for(let i=0;i<R;i++) {
+    const p=world(-1+2*i/(R-1),-1+2*j/(R-1)), v=field.sampleScalar(field.scalar,...p), o=(j*R+i)*4;
+    cmap(params.colormap,scalarT(v),rgb); data.set([rgb[0]*255,rgb[1]*255,rgb[2]*255,field.sampleScalar(field.maskF,...p)>0?0:255],o);
+  }
+  const tex=new THREE.DataTexture(data,R,R); tex.colorSpace=THREE.SRGBColorSpace;tex.needsUpdate=true;tex.magFilter=THREE.LinearFilter;
+  const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute([world(-1,-1),world(1,-1),world(1,1),world(-1,1)].flat(),3));
+  g.setAttribute('uv',new THREE.Float32BufferAttribute([0,0,1,0,1,1,0,1],2));g.setIndex([0,1,2,0,2,3]);
+  const mesh=new THREE.Mesh(g,new THREE.MeshBasicMaterial({map:tex,side:THREE.DoubleSide,forceSinglePass:true,transparent:S.sliceOpacity<1,opacity:S.sliceOpacity,depthWrite:S.sliceOpacity>=1}));
+  mesh.userData.scalarSliceAxis=ax;
+  groups.scalar.add(mesh);
+}
+function scalarSurfaces() {
+  const levels=params.scalar.levels.split(',').map(t=>t.trim()).filter(Boolean).map(Number);
+  if(levels.length>8 || !levels.every(Number.isFinite)) throw new Error('Enter up to eight comma-separated finite isovalues.');
+  const f=field, id=(i,j,k)=>(k*f.ny+j)*f.nx+i;
+  const corners=[[0,0,0],[1,0,0],[1,1,0],[0,1,0],[0,0,1],[1,0,1],[1,1,1],[0,1,1]];
+  const tets=[[0,1,2,6],[0,2,3,6],[0,3,7,6],[0,7,4,6],[0,4,5,6],[0,5,1,6]];
+  // Marching tetrahedra: consistent cube diagonal avoids ambiguous face cases.
+  for(const level of levels) {
+    const out=[];
+    for(let k=0;k<f.nz-1;k++) for(let j=0;j<f.ny-1;j++) for(let i=0;i<f.nx-1;i++) {
+      const ids=corners.map(c=>id(i+c[0],j+c[1],k+c[2])); if(ids.some(p=>f.mask[p])) continue;
+      const v=ids.map(p=>f.scalar[p]); if(level<Math.min(...v)||level>Math.max(...v)) continue;
+      const p=corners.map(c=>[f.coord(i+c[0],0),f.coord(j+c[1],1),f.coord(k+c[2],2)]);
+      for(const tet of tets) {
+        const inside=tet.filter(a=>v[a]<level),outside=tet.filter(a=>v[a]>=level);
+        if(!inside.length||!outside.length) continue;
+        const cut=(a,b)=>{const t=(level-v[a])/(v[b]-v[a]);return p[a].map((x,d)=>x+t*(p[b][d]-x));};
+        const toward=[0,1,2].map(d=>outside.reduce((s,a)=>s+p[a][d],0)/outside.length-inside.reduce((s,a)=>s+p[a][d],0)/inside.length);
+        const tri=(a,b,c)=>{
+          const u=b.map((x,d)=>x-a[d]),w=c.map((x,d)=>x-a[d]);
+          const dot=(u[1]*w[2]-u[2]*w[1])*toward[0]+(u[2]*w[0]-u[0]*w[2])*toward[1]+(u[0]*w[1]-u[1]*w[0])*toward[2];
+          if(dot<0)out.push(...a,...c,...b);else out.push(...a,...b,...c);
+        };
+        if(inside.length===1) tri(...outside.map(b=>cut(inside[0],b)));
+        else if(outside.length===1) tri(...inside.map(a=>cut(a,outside[0])).reverse());
+        else {const [a,b]=inside,[c,d]=outside,A=cut(a,c),B=cut(a,d),C=cut(b,c),D=cut(b,d);tri(A,B,C);tri(B,D,C);}
+      }
+      if(out.length>9000000) throw new Error('Surface too large; reduce grid resolution or use fewer isovalues.');
+    }
+    const raw=new THREE.BufferGeometry();raw.setAttribute('position',new THREE.Float32BufferAttribute(out,3));
+    const g=mergeVertices(raw,1e-6);raw.dispose();g.computeVertexNormals();
+    const rgb=cmap(params.colormap,scalarT(level),[0,0,0]);
+    const color=new THREE.Color().setRGB(...rgb,THREE.SRGBColorSpace);
+    groups.scalar.add(new THREE.Mesh(g,new THREE.MeshStandardMaterial(scalarMaterial({color,side:THREE.DoubleSide,roughness:.65,transparent:params.scalar.surfaceOpacity<1,opacity:params.scalar.surfaceOpacity,depthWrite:params.scalar.surfaceOpacity===1}))));
+    scalarState.triangles+=out.length/9;
+  }
+}
+function scalarPoints() {
+  const f=field,S=params.scalar, pos=[],colors=[],rgb=[0,0,0], stride=S.stride;
+  for(let k=0;k<f.nz;k+=stride)for(let j=0;j<f.ny;j+=stride)for(let i=0;i<f.nx;i+=stride){
+    const p=(k*f.ny+j)*f.nx+i,v=f.scalar[p];if(f.mask[p]||v<S.thresholdLow||v>S.thresholdHigh)continue;
+    pos.push(f.coord(i,0),f.coord(j,1),f.coord(k,2)); cmap(params.colormap,scalarT(v),rgb); colors.push(...rgb);
+  }
+  scalarState.samples=pos.length/3;
+  if(S.points) {const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
+    const linear=colors.map(v=>THREE.ColorManagement.toWorkingColorSpace(new THREE.Color(v,v,v),THREE.SRGBColorSpace).r);
+    g.setAttribute('color',new THREE.Float32BufferAttribute(linear,3));groups.scalar.add(new THREE.Points(g,new THREE.PointsMaterial(scalarMaterial({vertexColors:true,size:S.pointSize}))));}
+  if(S.voxels) {
+    if(pos.length/3>150000) throw new Error('Too many voxels; increase sampling stride.');
+    const size=f.hi.map((h,a)=>2*h/(f.dims[a]-1)*stride*.8);
+    // Clip the box dimensions, rather than its fragments, so boundary voxels keep all six faces.
+    const lower=['clipMinX','clipMinY','clipMinZ'].map((key,a)=>S[key]*f.hi[a]);
+    const upper=['clipX','clipY','clipZ'].map((key,a)=>S[key]*f.hi[a]);
+    const mesh=new THREE.InstancedMesh(new THREE.BoxGeometry(1,1,1),new THREE.MeshStandardMaterial(),pos.length/3),m=new THREE.Matrix4();
+    let count=0;
+    for(let i=0;i<pos.length/3;i++){
+      const lo=size.map((s,a)=>Math.max(lower[a],pos[i*3+a]-s/2));
+      const hi=size.map((s,a)=>Math.min(upper[a],pos[i*3+a]+s/2));
+      if(hi.some((h,a)=>h<=lo[a]))continue;
+      m.makeScale(...hi.map((h,a)=>h-lo[a]));m.setPosition(...hi.map((h,a)=>(h+lo[a])/2));
+      mesh.setMatrixAt(count,m);mesh.setColorAt(count,new THREE.Color().setRGB(...colors.slice(i*3,i*3+3),THREE.SRGBColorSpace));count++;
+    }
+    mesh.count=count;
+    if(!S.points)scalarState.samples=count;
+    groups.scalar.add(mesh);
+  }
+}
+function scalarVolume() {
+  if(!renderer.capabilities.isWebGL2) throw new Error('Volume rendering requires WebGL2. Slices and surfaces remain available.');
+  const f=field,S=params.scalar,N=f.scalar.length,lo=scalarState.lo,hi=scalarState.hi;
+  const bytes=new Uint8Array(N*2);
+  for(let i=0;i<N;i++){bytes[i*2]=Math.round(Math.max(0,Math.min(1,scalarT(f.scalar[i])))*255);bytes[i*2+1]=f.mask[i]?0:255;}
+  const tex=new THREE.Data3DTexture(bytes,f.nx,f.ny,f.nz);tex.format=THREE.RGFormat;tex.type=THREE.UnsignedByteType;tex.minFilter=tex.magFilter=THREE.LinearFilter;tex.unpackAlignment=1;tex.needsUpdate=true;
+  const palette=new Uint8Array(256*4);for(let i=0;i<256;i++){const c=cmap(params.colormap,i/255,[0,0,0]);palette.set([c[0]*255,c[1]*255,c[2]*255,255],i*4);}
+  const lut=new THREE.DataTexture(palette,256,1);lut.needsUpdate=true;lut.minFilter=lut.magFilter=THREE.LinearFilter;
+  const mat=new THREE.ShaderMaterial({glslVersion:THREE.GLSL3,side:THREE.BackSide,transparent:true,depthWrite:false,
+    uniforms:{volume:{value:tex},palette:{value:lut},eye:{value:new THREE.Vector3()},direction:{value:new THREE.Vector3()},ortho:{value:false},steps:{value:S.steps},density:{value:S.density},opacityRange:{value:new THREE.Vector2(S.opacityLow,S.opacityHigh)},opacityPower:{value:S.opacityPower},mip:{value:S.projection==='Maximum'},clipMin:{value:new THREE.Vector3(S.clipMinX,S.clipMinY,S.clipMinZ)},clipMax:{value:new THREE.Vector3(S.clipX,S.clipY,S.clipZ)},windowRange:{value:new THREE.Vector2(Math.max(0,scalarT(S.thresholdLow)),Math.min(1,scalarT(S.thresholdHigh))) }},
+    vertexShader:`out vec3 endpoint; void main(){ endpoint=position; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+    fragmentShader:`precision highp float; precision highp sampler3D;
+      uniform sampler3D volume; uniform sampler2D palette; uniform vec3 eye,direction,clipMin,clipMax; uniform bool ortho,mip; uniform int steps; uniform float density,opacityPower;uniform vec2 windowRange,opacityRange;
+      in vec3 endpoint;out vec4 fragColor;
+      #define gl_FragColor fragColor
+      void main(){vec3 rd=normalize(ortho?direction:endpoint-eye); vec3 ro=ortho?endpoint-rd*100.:eye;
+        vec3 safe=vec3(abs(rd.x)<1e-6?1e-6:rd.x,abs(rd.y)<1e-6?1e-6:rd.y,abs(rd.z)<1e-6?1e-6:rd.z);
+        if(any(greaterThanEqual(clipMin,clipMax)))discard;
+        vec3 t0=(clipMin-ro)/safe,t1=(clipMax-ro)/safe;vec3 mn=min(t0,t1),mx=max(t0,t1);
+        float entry=max(0.,max(mn.x,max(mn.y,mn.z))),exit=min(mx.x,min(mx.y,mx.z));if(exit<=entry)discard;
+        float dt=(exit-entry)/float(steps),peak=-1.;vec4 acc=vec4(0.);
+        for(int i=0;i<512;i++){if(i>=steps)break;vec3 p=ro+rd*(entry+(float(i)+.5)*dt);vec2 s=texture(volume,p*.5+.5).rg;
+          if(s.g<.999||s.r<windowRange.x||s.r>windowRange.y)continue;
+          if(mip){peak=max(peak,s.r);continue;}
+          vec3 c=texture(palette,vec2(s.r,.5)).rgb;c=pow(c,vec3(2.2));float opacity=mix(opacityRange.x,opacityRange.y,pow(s.r,opacityPower));float a=1.-exp(-density*dt*opacity);
+          acc.rgb+=(1.-acc.a)*a*c;acc.a+=(1.-acc.a)*a;if(acc.a>.98)break;
+        }
+        if(mip){if(peak<0.)discard;acc=vec4(pow(texture(palette,vec2(peak,.5)).rgb,vec3(2.2)),1.);}
+        else if(acc.a>0.)acc.rgb/=acc.a;fragColor=acc;
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }`});
+  const mesh=new THREE.Mesh(new THREE.BoxGeometry(2,2,2),mat);mesh.scale.set(...f.hi);
+  mesh.onBeforeRender=()=>{mat.uniforms.eye.value.copy(camera.position).divide(mesh.scale);camera.getWorldDirection(mat.uniforms.direction.value).divide(mesh.scale);mat.uniforms.ortho.value=camera.isOrthographicCamera===true;};
+  // clearGroup disposes maps automatically; these uniforms own textures too.
+  mat.addEventListener('dispose',()=>{tex.dispose();lut.dispose();});groups.scalar.add(mesh);
+}
+function scalarLegend(el) {
+  const [lo,hi]=scalarRange();const row=legendRow(params.colormap,lo,hi,'Scalar');
+  row.querySelector('.title').textContent=`${field.scalarName}${field.units?' ('+field.units+')':''} · ${params.scalar.scale}`;
+  if(params.scalar.scale!=='Linear')row.querySelectorAll('.ticks span')[1].textContent='';
+  el.appendChild(row);el.style.display='';
+  const hist=document.createElement('canvas');hist.width=220;hist.height=40;hist.style.height='40px';hist.title='Distribution of finite samples (linear value axis)';
+  const bins=new Uint32Array(44), a=scalarState.sorted;for(const v of a)bins[Math.max(0,Math.min(43,Math.floor((v-lo)/(hi-lo)*44)))]++;
+  const ctx=hist.getContext('2d'),peak=Math.max(...bins)||1;ctx.fillStyle='#98afc8';bins.forEach((n,i)=>ctx.fillRect(i*5,40-38*n/peak,4,38*n/peak));el.appendChild(hist);
+}
+function scalarInfo() {
+  const S=params.scalar,p=field.normToWorld([S.probeX,S.probeY,S.probeZ]),v=field.sampleScalar(field.scalar,...p),missing=field.sampleScalar(field.maskF,...p)>0;
+  const xyz=p.map((x,a)=>field.origin[a]+(x-field.lo[a])/field.k[a]);
+  document.getElementById('stats').textContent=`${live?.frames?`live frame ${live.seq} · t=${live.time.toFixed(2)} s · `:''}Scalar · grid ${field.dims.join(' × ')} · ${scalarState.triangles} triangles · ${scalarState.samples} samples\nRange ${scalarState.sorted[0].toPrecision(4)} … ${scalarState.sorted.at(-1).toPrecision(4)} · missing ${field.mask.reduce((a,b)=>a+b,0)}\nProbe (${xyz.map(x=>+x.toPrecision(4)).join(', ')}): ${missing?'no data':v.toPrecision(5)+' '+field.units}`;
+  document.getElementById('stats').style.whiteSpace='pre-line';
+}
+function syncMode() {
+  const scalar=params.mode==='Scalar';
+  exampleControl.name(scalar ? 'Load example: temperature' : 'Load example: terrain wind');
+  for(const f of [fA,fL,fP,fS]) f.show(!scalar);
+  scalarFolder.show(scalar);scalarData.show(scalar);
+  generatorControl.show(!scalar);presetControl.show(!scalar);
+  gui.controllersRecursive().forEach(c=>c.updateDisplay());
+}
+const generatorControl=fData.controllers.find(c=>c.property==='generator');
+const presetControl=gui.controllers.find(c=>c.property==='preset');
+gui.add(params,'mode',['Vector','Scalar']).name('Field mode').onChange(withBusy(()=>{syncMode();return regenerate();}));
+gui.$children.prepend(gui.controllers.at(-1).domElement);
+const scalarData=fData.addFolder('Scalar examples');
+scalarData.add(params.scalar,'example',Object.keys(SCALAR_EXAMPLES)).onChange(withBusy(regenerate));
+const scalarFolder=gui.addFolder('Scalar display'),SCL=params.scalar;
+const refreshScalar=withBusy(()=>{rebuildAll();});
+scalarFolder.add(SCL,'preset',['Slices + surface','Three slices','Isosurfaces','Transparent volume','Maximum projection','Uniform grid points','Threshold voxels']).onChange(()=>{
+  const p=SCL.preset;SCL.x=SCL.y=SCL.z=p==='Three slices'||p==='Slices + surface';SCL.surfaces=p==='Isosurfaces'||p==='Slices + surface';
+  SCL.volume=p==='Transparent volume'||p==='Maximum projection';SCL.projection=p==='Maximum projection'?'Maximum':'Composite';SCL.voxels=p==='Threshold voxels';SCL.points=p==='Uniform grid points';
+  if(SCL.points){SCL.thresholdLow=scalarState.sorted[0];SCL.thresholdHigh=scalarState.sorted.at(-1);samplesFolder.open();}
+  gui.controllersRecursive().forEach(c=>c.updateDisplay());refreshScalar();
+});
+const slicesFolder=scalarFolder.addFolder('Slices');
+for(const [ax,key] of ['x','y','z'].entries()){
+  slicesFolder.add(SCL,key).name(key.toUpperCase()+' plane').onChange(refreshScalar);
+  slicesFolder.add(SCL,'p'+key,-1,1,.01).name(key+' position').onChange(()=>{
+    if(field?.scalar && SCL[key]) scalarSlice(ax,SCL['p'+key]);
+  });
+}
+slicesFolder.add(SCL,'sliceOpacity',.05,1,.05).onFinishChange(refreshScalar);
+const isoFolder=scalarFolder.addFolder('Isosurfaces');isoFolder.add(SCL,'surfaces').onChange(refreshScalar);isoFolder.add(SCL,'levels').name('Isovalues').onFinishChange(refreshScalar);isoFolder.add(SCL,'surfaceOpacity',.05,1,.05).onFinishChange(refreshScalar);
+const volFolder=scalarFolder.addFolder('Volume');volFolder.add(SCL,'volume').onChange(refreshScalar);volFolder.add(SCL,'projection',['Composite','Maximum']).onChange(refreshScalar);volFolder.add(SCL,'density',.1,20,.1).onFinishChange(refreshScalar);volFolder.add(SCL,'steps',32,512,16).name('Quality / ray steps').onFinishChange(refreshScalar);volFolder.close();
+for(const key of ['opacityLow','opacityHigh'])volFolder.add(SCL,key,0,1,.01).onFinishChange(refreshScalar);
+volFolder.add(SCL,'opacityPower',.1,8,.1).onFinishChange(refreshScalar);
+const samplesFolder=scalarFolder.addFolder('Points / voxels');for(const key of ['points','voxels'])samplesFolder.add(SCL,key).onChange(refreshScalar);samplesFolder.add(SCL,'stride',1,12,1).onFinishChange(refreshScalar);samplesFolder.close();
+samplesFolder.controllers.find(c=>c.property==='points').name('Show grid points');
+samplesFolder.controllers.find(c=>c.property==='stride').name('Sampling stride');
+samplesFolder.add(SCL,'pointSize',0.005,0.15,0.005).name('Point size').onFinishChange(refreshScalar);
+const rangeFolder=scalarFolder.addFolder('Color and value range');rangeFolder.add(SCL,'range',['Full','Percentile 2–98','Centered','Manual']).onChange(refreshScalar);
+for(const key of ['min','max','center'])rangeFolder.add(SCL,key).onFinishChange(refreshScalar);
+rangeFolder.add(SCL,'scale',['Linear','Log','Symmetric log']).onChange(refreshScalar);rangeFolder.add(SCL,'linthresh',.001,10,.001).name('Sym-log threshold').onFinishChange(refreshScalar);
+for(const key of ['thresholdLow','thresholdHigh'])rangeFolder.add(SCL,key).name(key==='thresholdLow'?'Visible values ≥':'Visible values ≤').onFinishChange(refreshScalar);
+rangeFolder.close();
+const clipFolder=scalarFolder.addFolder('Clip and probe');for(const key of ['clipX','clipY','clipZ'])clipFolder.add(SCL,key,-1,1,.01).onFinishChange(refreshScalar);
+for(const key of ['clipMinX','clipMinY','clipMinZ'])clipFolder.add(SCL,key,-1,1,.01).onFinishChange(refreshScalar);
+for(const key of ['probeX','probeY','probeZ'])clipFolder.add(SCL,key,-1,1,.01).onChange(()=>updateInfo());clipFolder.close();
+const scalarLabels={sliceOpacity:'Slice opacity',surfaceOpacity:'Surface opacity',surfaces:'Show surfaces',volume:'Show volume',opacityLow:'Opacity at low value',opacityHigh:'Opacity at high value',opacityPower:'Opacity curve power',linthresh:'Sym-log threshold',clipX:'X maximum',clipY:'Y maximum',clipZ:'Z maximum',clipMinX:'X minimum',clipMinY:'Y minimum',clipMinZ:'Z minimum',probeX:'Probe X',probeY:'Probe Y',probeZ:'Probe Z'};
+scalarFolder.controllersRecursive().forEach(c=>{if(scalarLabels[c.property])c.name(scalarLabels[c.property]);});
+syncMode();
+
+function readScalarFile(name,buf) {
+  if(name!=='CSV (.csv)')return null;
+  const text=td.decode(buf), lines=text.split(/\r?\n/).filter(l=>l.trim()&&!l.trim().startsWith('#'));
+  if(!lines.length)throw new Error('Empty CSV.');
+  const split=l=>l.trim().split(lines[0].includes(',')?',':lines[0].includes(';')?';':/\s+/).map(s=>s.trim().replace(/^"|"$/g,''));
+  const header=split(lines[0]),hasHeader=header.some(v=>Number.isNaN(Number(v))),head=header.map(v=>v.toLowerCase());
+  if(hasHeader && head.some(h=>['vx','u','velocity:0','velocity_x'].includes(h)))return null;
+  if(!hasHeader && header.length!==4)return null;
+  const coords=hasHeader?['x','y','z'].map((v,a)=>head.findIndex(h=>[v,`points:${a}`,`coords:${a}`].includes(h))):[0,1,2];
+  const values=hasHeader?head.map((_,i)=>i).filter(i=>!coords.includes(i)):[3];
+  if(coords.some(i=>i<0)||values.length!==1)throw new Error('Scalar CSV requires x,y,z and one named value column.');
+  const rows=lines.slice(hasHeader?1:0).map(l=>{const a=split(l);return [...coords,values[0]].map(i=>a[i]===''?NaN:Number(a[i]));});
+  if(rows.some(r=>!r.slice(0,3).every(Number.isFinite)))throw new Error('CSV coordinates must be finite.');
+  const axes=[0,1,2].map(a=>[...new Set(rows.map(r=>r[a]))].sort((a,b)=>a-b));
+  const dims=axes.map(a=>a.length), spacing=axes.map(a=>(a.at(-1)-a[0])/(a.length-1));
+  if(axes.some((a,d)=>a.some((v,i)=>Math.abs(v-a[0]-spacing[d]*i)>Math.max(1,Math.abs(v),Math.abs(spacing[d]))*1e-6)))throw new Error('Scalar CSV coordinates must form a uniformly spaced grid.');
+  if(dims.reduce((a,b)=>a*b,1)!==rows.length)throw new Error('CSV must contain a complete grid.');
+  const maps=axes.map(a=>new Map(a.map((v,i)=>[v,i]))),data=new Float32Array(rows.length),seen=new Uint8Array(rows.length);
+  for(const r of rows){const p=(maps[2].get(r[2])*dims[1]+maps[1].get(r[1]))*dims[0]+maps[0].get(r[0]);if(seen[p])throw new Error('Duplicate CSV coordinate.');seen[p]=1;data[p]=r[3];}
+  const metaLine=text.split(/\r?\n/).find(l=>l.startsWith('# field-viz '));
+  const meta=metaLine?JSON.parse(metaLine.slice(12)):{};
+  return {dims,data,scalar:true,origin:axes.map(a=>a[0]),spacing,name:meta.name||(hasHeader?header[values[0]]:'Scalar value'),units:meta.units||''};
+}
+function scalarFormat(name) {
+  return { ...FORMATS[name], write(f) {
+    const data=Float32Array.from(f.scalar,(v,i)=>f.mask[i]?NaN:v), N=data.length;
+    const meta={kind:'scalar',name:f.scalarName,units:f.units,dims:f.dims,origin:f.origin,spacing:f.spacing};
+    if(name==='JSON (.json)')return [JSON.stringify({...meta,data:Array.from(data),mask:Array.from(f.mask)})];
+    if(name==='CSV (.csv)') {
+      const lines=['# field-viz '+JSON.stringify({name:f.scalarName,units:f.units}),'x,y,z,value'];let p=0;
+      for(let k=0;k<f.nz;k++)for(let j=0;j<f.ny;j++)for(let i=0;i<f.nx;i++)lines.push([f.phys(i,0),f.phys(j,1),f.phys(k,2),data[p++]].join(','));return [lines.join('\n')+'\n'];
+    }
+    if(name==='NumPy (.npy)') {
+      let h=`{'descr': '<f4', 'fortran_order': False, 'shape': (${f.nz}, ${f.ny}, ${f.nx}), }`;
+      h=h.padEnd(Math.ceil((10+h.length+1)/64)*64-11)+'\n';const pre=new Uint8Array([147,78,85,77,80,89,1,0,0,0]);new DataView(pre.buffer).setUint16(8,h.length,true);
+      const raw=new DataView(new ArrayBuffer(N*4));data.forEach((v,i)=>raw.setFloat32(i*4,v,true));return [pre,h,raw.buffer];
+    }
+    if(name==='VTK legacy (.vtk)') {
+      const raw=new DataView(new ArrayBuffer(N*4));data.forEach((v,i)=>raw.setFloat32(i*4,v,false));
+      return [`# vtk DataFile Version 3.0\nscalar field\nBINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS ${f.dims.join(' ')}\nORIGIN ${nums(f.origin)}\nSPACING ${nums(f.spacing)}\nPOINT_DATA ${N}\nSCALARS scalar float 1\nLOOKUP_TABLE default\n`,raw.buffer,'\n'];
+    }
+    const raw=new Uint8Array(4+N*4),dv=new DataView(raw.buffer);dv.setUint32(0,N*4,true);data.forEach((v,i)=>dv.setFloat32(4+i*4,v,true));
+    const ext=`0 ${f.nx-1} 0 ${f.ny-1} 0 ${f.nz-1}`;
+    return [`<?xml version="1.0"?><VTKFile type="ImageData" byte_order="LittleEndian" header_type="UInt32"><ImageData WholeExtent="${ext}" Origin="${nums(f.origin)}" Spacing="${nums(f.spacing)}"><Piece Extent="${ext}"><PointData Scalars="scalar"><DataArray type="Float32" Name="scalar" NumberOfComponents="1" format="binary">${b64encode(raw)}</DataArray></PointData></Piece></ImageData></VTKFile>`];
+  }};
+}
+
 function resize() {
   const w = innerWidth, h = innerHeight;
   renderer.setSize(w, h, false); canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
@@ -1394,7 +1767,7 @@ const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.05);
   lineUniforms.uTime.value += dt * params.lines.pulseSpeed;
-  updateParticles(dt);
+  if (!field?.scalar) updateParticles(dt);
   controls.update();
   renderer.render(scene, camera);
 });

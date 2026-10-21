@@ -1,0 +1,50 @@
+[
+  {
+    "path": "three/build/three.module.js",
+    "package": "three",
+    "version": "0.160.0",
+    "source": "https://registry.npmjs.org/three/-/three-0.160.0.tgz",
+    "archive_path": "package/build/three.module.js",
+    "sha256": "76dea8151bc9352aef3528b4262e249b2604f62543828328db978d060d61a495"
+  },
+  {
+    "path": "three/examples/jsm/controls/OrbitControls.js",
+    "package": "three",
+    "version": "0.160.0",
+    "source": "https://registry.npmjs.org/three/-/three-0.160.0.tgz",
+    "archive_path": "package/examples/jsm/controls/OrbitControls.js",
+    "sha256": "5a44a9e86a2a0fb11933eed69bc2cd33c76a496854c1aed6ed776efa87d7b064"
+  },
+  {
+    "path": "three/examples/jsm/utils/BufferGeometryUtils.js",
+    "package": "three",
+    "version": "0.160.0",
+    "source": "https://registry.npmjs.org/three/-/three-0.160.0.tgz",
+    "archive_path": "package/examples/jsm/utils/BufferGeometryUtils.js",
+    "sha256": "9be041e96308775d00e2695cc607645b9a9b64fd7c0e759dd8f7c00a8d92becb"
+  },
+  {
+    "path": "three/LICENSE",
+    "package": "three",
+    "version": "0.160.0",
+    "source": "https://registry.npmjs.org/three/-/three-0.160.0.tgz",
+    "archive_path": "package/LICENSE",
+    "sha256": "852e0e8699169bf9f6fdc6bda3e682d078dcbc738b5d33e74df594721bff271d"
+  },
+  {
+    "path": "lil-gui/lil-gui.esm.js",
+    "package": "lil-gui",
+    "version": "0.19.2",
+    "source": "https://registry.npmjs.org/lil-gui/-/lil-gui-0.19.2.tgz",
+    "archive_path": "package/dist/lil-gui.esm.js",
+    "sha256": "ff934a599715bfb72534dda8aea206bf23630b56a49e1aa0d9ad0ab5dfeab985"
+  },
+  {
+    "path": "lil-gui/LICENSE.md",
+    "package": "lil-gui",
+    "version": "0.19.2",
+    "source": "https://registry.npmjs.org/lil-gui/-/lil-gui-0.19.2.tgz",
+    "archive_path": "package/LICENSE.md",
+    "sha256": "8cf4a9691239b14c715613ed8e41580d18ee433c862e263058393b35be6c8e53"
+  }
+]

@@ -1,9 +1,20 @@
 # field-viz
 
-A WebGL viewer for 3D vector fields (air flow, velocity fields, force fields) on regular,
+An interactive WebGL viewer for **3D vector and scalar fields**: air flow, velocity,
+temperature, electric potential, charge density and more.
+
+The viewer is a single HTML page using three.js. Open it directly for in-browser examples
+and file import/export, or use one of two optional Python backends: a stdlib-only REST
+server or a Flask + ZeroMQ relay for live, time-varying data.
+
+Both modes share camera controls, color palettes and physical grid proportions. Choose
+**Field mode** in the controls to switch between [Vector fields](#vector-fields) and
+[Scalar fields](#scalar-fields).
+
+## Vector fields
+
+Choose **Field mode → Vector** to visualize air flow, velocity and force fields on regular,
 rectilinear and terrain-following grids.
-It is a single HTML page using three.js. Two backends are optional: a stdlib-only Python REST
-server, and a Flask + ZeroMQ relay that streams time-varying data live.
 
 ![Tornado field with animated streamlines](docs/screenshot.png)
 
@@ -11,7 +22,7 @@ server, and a Flask + ZeroMQ relay that streams time-varying data live.
 
 ![WindNinja-like terrain wind example](docs/screenshot-terrain.png)
 
-## Features
+### Features
 
 - **Synthetic generators:** tornado, flow past a sphere (potential flow), ABC flow, turbulent wind
   (curl noise), Lorenz attractor, sources and sinks, convection rolls.
@@ -37,7 +48,7 @@ server, and a Flask + ZeroMQ relay that streams time-varying data live.
 - **Import/export:** VTK legacy, VTK XML ImageData, NumPy, CSV, JSON (see below). You can also
   drag and drop a file onto the page.
 
-## Running the examples
+### Running the examples
 
 |   | What runs                              | Data source in the viewer                  | Needs                               |
 | - | -------------------------------------- | ------------------------------------------ | ----------------------------------- |
@@ -47,9 +58,14 @@ server, and a Flask + ZeroMQ relay that streams time-varying data live.
 | 4 | `stream_server.py` + your own code   | live stream of your data                   | same as 3                           |
 
 The page detects which backend it is talking to and adds a **data source** switch.
-three.js and lil-gui load from the jsDelivr CDN, so the page needs internet access.
+When served over HTTP, three.js and lil-gui load from the bundled `vendor/` directory,
+so the viewer works without internet access. Keep that directory alongside `index.html`
+when copying or hosting the app. The bundled versions are three.js 0.160.0 and lil-gui 0.19.2.
+Opening `index.html` directly with `file://` still uses jsDelivr and requires internet access,
+because browsers restrict imports of neighboring local JavaScript modules. For offline use,
+run `python server.py` (or `python -m http.server`) and open `http://localhost:8000/`.
 
-### 1. Static, no backend
+#### 1. Static, no backend
 
 Open `index.html` directly, or serve the folder with any static server
 (`python -m http.server`, nginx, GitHub Pages, ...). All fields are generated in the browser.
@@ -59,7 +75,7 @@ wind in the style of WindNinja's output (details below). Click **Data → Load e
 wind**, which needs the page to be served over HTTP (option 1 with `python -m http.server`, or
 2–3), or drag the file onto the page.
 
-### 2. REST server
+#### 2. REST server
 
 ```
 python server.py              # http://localhost:8000/   (python server.py 8080 for another port)
@@ -68,7 +84,7 @@ python server.py              # http://localhost:8000/   (python server.py 8080 
 To keep a static page but fetch data from a server on another host, add `?api=`:
 `index.html?api=http://localhost:8000/`. The backend sends CORS headers.
 
-### 3. Live streaming demo
+#### 3. Live streaming demo
 
 ![Live stream from the demo producer](docs/screenshot-live.png)
 
@@ -109,7 +125,7 @@ producer(s) ──ZeroMQ PUB/SUB──▶ stream_server.py ──WebSocket, bina
 The frame layout is documented in [fieldstream.py](fieldstream.py), which also provides
 `encode_frame` / `decode_frame`.
 
-### 4. Streaming your own data
+#### 4. Streaming your own data
 
 ```python
 from fieldstream import FieldPublisher
@@ -128,7 +144,7 @@ publisher with `FieldPublisher("tcp://relay-host:5556", bind=False)`.
 Both servers use development web servers, which is fine on a local machine or LAN. For anything
 public, put the Flask app behind a production server.
 
-## REST API
+### REST API
 
 | Request                                  | Response                                                                         |
 | ---------------------------------------- | -------------------------------------------------------------------------------- |
@@ -138,7 +154,7 @@ public, put the Flask app behind a production server.
 
 `n` must be between 2 and 64. Generator ids: `tornado`, `sphere`, `abc`, `turbulence`, `lorenz`, `charges`, `convection`.
 
-## Data formats
+### Data formats
 
 Vectors are stored point by point on a regular grid, with x varying fastest, then y, then z.
 The grid's physical **origin and spacing** are read from `.vtk`, `.vti`, `.csv` and `.json` and
@@ -158,7 +174,7 @@ are computed in physical units.
 | `.csv`                   | ✓     | ✓     | Columns `x,y,z,vx,vy,vz`. Also accepts `u,v,w` or ParaView names (`Points:0`, `velocity:0`, ...). Rows may be in any order but must form a complete grid.        |
 | `.json`                  | ✓     | ✓     | `{"dims":[nx,ny,nz], "origin":[x0,y0,z0], "spacing":[dx,dy,dz], "data":[vx,vy,vz,...]}`; origin and spacing are optional                                              |
 
-### Non-uniform grids (structured grids, rectilinear grids, terrain-following meshes)
+#### Non-uniform grids (structured grids, rectilinear grids, terrain-following meshes)
 
 The viewer samples regular grids, so a VTK `STRUCTURED_GRID` (point coordinates for every node)
 or `RECTILINEAR_GRID` (non-uniform x/y/z coordinate lists) is **resampled onto a regular grid
@@ -204,12 +220,103 @@ Writing a field for the viewer:
 np.save("my_field.npy", field.astype(np.float32))   # field shape (nz, ny, nx, 3)
 ```
 
-## Adding a generator
+### Adding a generator
 
 - **Backend:** add a factory to `GENERATORS` in `server.py`. It returns `f(x, y, z) -> (vx, vy, vz)`
   over the domain [-1, 1]³.
 - **Browser:** add the matching entry to `GENERATORS` in `index.html`. Use the same display name
   so the per-field decorations and seeding are reused.
+
+## Scalar fields
+
+Choose **Field mode → Scalar** in the controls. This works in the standalone HTML,
+with the stdlib REST server, and with the live streaming relay. Vector mode remains available.
+
+![Scalar field with intersecting slices and isosurfaces](docs/screenshot-scalar.png)
+
+Scalar display layers can be combined:
+
+- Three independently movable X/Y/Z slices.
+- Up to eight isosurfaces (enter comma-separated values), with adjustable opacity.
+- GPU volume rendering with composite or maximum-value projection; density, ray-step quality
+  and a separate opacity mapping (low/high opacity and curve power).
+- Colored points or thresholded voxel boxes, with adjustable sampling stride.
+- **Uniform grid points** preset: a regular 3D lattice colored by scalar value, with
+  adjustable point size. Sampling stride 1 shows every valid grid node; stride 2 shows
+  every second node along each axis. Missing samples are omitted. Choosing this preset
+  resets the value filter to include the full data range.
+- Six clipping boundaries and a probe reporting physical coordinates and the interpolated value.
+
+Presets include slices + surface, three slices, isosurfaces, transparent volume,
+maximum projection and threshold voxels. All existing color palettes can be reversed.
+Color ranges can use the full distribution, 2–98 percentiles, a symmetric range around a chosen
+center, or manual limits. Linear, positive logarithmic and symmetric-log scales are available.
+The histogram uses a linear value axis. **Visible values ≥ / ≤** filter points, voxels and volume;
+slice and isosurface layers retain their own plane/level controls.
+
+Examples: Gaussian hot spot, overlapping peaks, atmospheric temperature, softened electric
+dipole potential, signed charge density, heat pulse and gyroid. These are illustrative analytic
+fields, not physically solved simulations. Electric potential and charge density are scalar;
+the existing electric-field example is vector.
+
+### Scalar files
+
+**Example dataset:** [examples/temperature_plume.json](examples/temperature_plume.json) contains
+a synthetic air-temperature field with a warm plume, a vertical lapse rate and an elevated
+inversion layer. It has a 25 × 21 × 17 grid spanning 2.4 × 2.0 × 1.2 km, with temperatures
+in degrees Celsius and coordinates in meters. It is illustrative, not a solved simulation.
+In Scalar mode, click **Data → Load example: temperature**, or drag the file onto the viewer.
+The button requires serving the folder over HTTP; drag-and-drop also works when opening
+the HTML directly. In Vector mode, the same button loads the terrain-wind example.
+
+Import detects scalar-only files automatically. When a VTK file contains both vectors and
+scalars, choose Scalar mode before importing to read its first scalar point array.
+
+| Format | Scalar layout | Metadata |
+| --- | --- | --- |
+| CSV | `x,y,z,value` (one arbitrary named value column also accepted); complete uniform grid, rows in any order | Coordinates; exported comment preserves name/units |
+| NumPy `.npy` | `(nz, ny, nx)`, x fastest in C order; Fortran order also accepted | Unit spacing and zero origin on import; no names/units |
+| JSON | `kind: "scalar"`, `dims: [nx,ny,nz]`, flat `data` | `origin`, `spacing`, `name`, `units`, `mask` |
+| VTK `.vtk` | Legacy `STRUCTURED_POINTS`, point `SCALARS` | Origin/spacing; exported array is named `scalar` |
+| VTK `.vti` | ImageData, one-component PointData; ASCII or uncompressed inline binary | Origin/spacing; exported array is named `scalar` |
+
+Samples are values at grid points. Missing samples use NaN (JSON uses null or a mask);
+zero is valid data. Missing cells are excluded from slices/surfaces/volumes. Scalar import
+currently requires regular grids; terrain-following/curvilinear scalar grids, cell-centered data,
+scattered measurements, `.npz`, and multiple selectable arrays are not supported yet.
+JSON and CSV preserve field names/units; NPY and the current VTK scalar exports do not.
+Volume rendering uses an 8-bit display texture after color scaling; source values and exports
+remain float32. It requires WebGL2. Isosurfaces use marching tetrahedra and can become expensive
+on large grids; reduce resolution or the number of levels for interactive streaming.
+
+### Scalar streaming and REST
+
+```
+python producer.py --scenario heat --n 32 --fps 5
+python stream_server.py
+```
+
+Or publish your own NumPy array:
+
+```python
+from fieldstream import FieldPublisher
+pub = FieldPublisher()
+# temperature has shape (nz, ny, nx)
+pub.send(temperature, name="Air temperature", units="°C",
+         origin=(0, 0, 0), spacing=(50, 50, 20))
+```
+
+Scalar binary frames use magic `SF01`, the same 40-byte header as `VF01`, and one value per
+grid point. Existing vector frames remain `VF01`. Float32 supports missing values; int16
+quantization requires finite data. Scalar streams lock the initial color limits to a manual
+range so colors stay comparable over time; adjust manual limits if the simulation outgrows them.
+
+`GET /api/fields` now includes `kind` (`vector` or `scalar`). Scalar generator IDs are
+`scalar_gaussian`, `scalar_two`, `scalar_temperature`, `scalar_potential`, `scalar_charge`,
+`scalar_heat`, `scalar_gyroid`. The existing `n` and `format` query parameters apply to them.
+
+Run regression checks with `python -m pytest -q` (requires NumPy, pytest and Playwright with
+Chromium). Tests cover frames, REST exports, scalar rendering, file round trips and vector mode.
 
 ## License
 
